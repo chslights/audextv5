@@ -522,79 +522,81 @@ for _r in raw_results:
 _action_queue = build_prioritized_action_queue(_evidence_items_for_queue)
 _next_best = next_best_question(_evidence_items_for_queue)
 if _next_best:
-    st.info(f"Next best item: {_next_best['source_file']} — {_next_best['question_text']}")
+    _best_detail = _next_best.get("flag_description") or _next_best["question_text"]
+    st.info(f"Next best item: {_next_best['source_file']} — {_best_detail}")
+if st.session_state.get("_opened_from_queue"):
+    st.success(f"Opened {st.session_state['_opened_from_queue']} below in Document Detail.")
+    st.session_state.pop("_opened_from_queue")
 if _action_queue:
     st.markdown('<div class="section-title">Questions to Resolve</div>', unsafe_allow_html=True)
-    st.caption("Answer questions here directly, or jump to the matching file detail. Sorted by blocking status first, then client dependencies, then reviewer follow-up.")
-
-    for _item in _action_queue:
-        _qkey = _item["question_id"]
-        _source_file = _item["source_file"]
-        _priority = _item["priority_label"]
-        _aud = _item["audience"]
-        _blocking_label = "Blocking" if _item["blocking"] else "Review"
-        _bg = "#fefce8" if _aud == "client" else "#eff6ff"
-        _border = "#f59e0b" if _aud == "client" else "#3b82f6"
-        st.markdown(
-            f"<div style='background:{_bg};border-left:4px solid {_border};padding:10px 12px;margin:8px 0;border-radius:0 4px 4px 0'>"
-            f"<div style='font-size:0.82rem;color:#6b7280;font-weight:600'>{_source_file} · {_priority} · {_aud} · {_blocking_label}</div>"
-            f"<div style='font-size:0.92rem;font-weight:600;color:#111827;margin-top:4px'>{_item['question_text']}</div>"
-            f"<div style='font-size:0.78rem;color:#6b7280;margin-top:2px'>{_item['question_type']}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        _cols = st.columns([3, 1.4, 1.2, 1.2])
-        with _cols[0]:
-            _queue_answer = st.text_input(
-                "Answer",
-                key=f"queue_answer_{_source_file}_{_qkey}",
-                placeholder="Type your answer or note here...",
-                label_visibility="collapsed",
-            )
-        with _cols[1]:
-            _queue_type = st.selectbox(
-                "Resolution type",
-                ["answer", "reviewer_confirmed", "override", "dismissed"],
-                key=f"queue_type_{_source_file}_{_qkey}",
-                label_visibility="collapsed",
-            )
-        with _cols[2]:
-            if st.button("Resolve", key=f"queue_resolve_{_source_file}_{_qkey}", type="primary"):
-                def _apply_queue_resolution(_ev, _qid=_qkey, _ans=_queue_answer, _rtype=_queue_type, _aud=_aud):
-                    resolve_question(
-                        _ev, _qid,
-                        _ans or "resolved from questions to resolve",
-                        actor="reviewer" if _aud == "reviewer" else "reviewer",
-                        resolution_type=_rtype,
-                        comment=_ans or "resolved from questions to resolve",
+    st.caption("Keep this section light: answer quick items here, or open the file detail below when you need more context.")
+    with st.expander(f"Open question queue ({len(_action_queue)})", expanded=False):
+        for _item in _action_queue:
+            _qkey = _item["question_id"]
+            _source_file = _item["source_file"]
+            _priority = _item["priority_label"]
+            _aud = _item["audience"]
+            _blocking_label = "Blocking" if _item["blocking"] else "Review"
+            _detail = _item.get("flag_description") or _item["question_text"]
+            _exp_label = f"{_source_file} · {_blocking_label} · {_aud}"
+            with st.expander(_exp_label, expanded=False):
+                st.markdown(f"**{_item['question_text']}**")
+                if _detail and _detail != _item["question_text"]:
+                    st.caption(_detail)
+                _cols = st.columns([3, 1.2, 1, 1])
+                with _cols[0]:
+                    _queue_answer = st.text_input(
+                        "Answer",
+                        key=f"queue_answer_{_source_file}_{_qkey}",
+                        placeholder="Type your answer or note here...",
+                        label_visibility="collapsed",
                     )
-                _update_evidence_in_session(_source_file, _apply_queue_resolution)
-                _focus_document(_source_file, _qkey)
-                st.rerun()
-        with _cols[3]:
-            if st.button("Open file", key=f"queue_open_{_source_file}_{_qkey}"):
-                _focus_document(_source_file, _qkey)
-                st.rerun()
+                with _cols[1]:
+                    _queue_type = st.selectbox(
+                        "Resolution type",
+                        ["answer", "reviewer_confirmed", "override", "dismissed"],
+                        key=f"queue_type_{_source_file}_{_qkey}",
+                        label_visibility="collapsed",
+                    )
+                with _cols[2]:
+                    if st.button("Resolve", key=f"queue_resolve_{_source_file}_{_qkey}", type="primary"):
+                        def _apply_queue_resolution(_ev, _qid=_qkey, _ans=_queue_answer, _rtype=_queue_type, _aud=_aud):
+                            resolve_question(
+                                _ev, _qid,
+                                _ans or "resolved from questions to resolve",
+                                actor="reviewer",
+                                resolution_type=_rtype,
+                                comment=_ans or "resolved from questions to resolve",
+                            )
+                        _update_evidence_in_session(_source_file, _apply_queue_resolution)
+                        _focus_document(_source_file, _qkey)
+                        st.session_state["_opened_from_queue"] = _source_file
+                        st.rerun()
+                with _cols[3]:
+                    if st.button("Open file", key=f"queue_open_{_source_file}_{_qkey}"):
+                        _focus_document(_source_file, _qkey)
+                        st.session_state["_opened_from_queue"] = _source_file
+                        st.rerun()
 
     _client_pkg = build_client_followup_package(_evidence_items_for_queue)
     if _client_pkg:
-        st.markdown("**Client follow-up package**")
-        for _item in _client_pkg:
-            st.markdown(f"**{_item['source_file']}** — {_item['request_count']} open client request(s), {_item['blocking_count']} blocking")
-            for _req in _item["requests"]:
-                st.markdown(f"- {_req}")
-            _cp_cols = st.columns([1, 5])
-            with _cp_cols[0]:
+        with st.expander(f"Client follow-up package ({sum(_i['request_count'] for _i in _client_pkg)})", expanded=False):
+            for _item in _client_pkg:
+                st.markdown(f"**{_item['source_file']}** — {_item['request_count']} open client request(s), {_item['blocking_count']} blocking")
+                for _req in _item["requests"]:
+                    _req_text = _req.get("flag_description") or _req.get("question_text")
+                    st.markdown(f"- {_req_text}")
                 if st.button("Open file", key=f"client_pkg_open_{_item['source_file']}"):
                     _focus_document(_item['source_file'])
+                    st.session_state["_opened_from_queue"] = _item['source_file']
                     st.rerun()
-        _client_export = []
-        for _item in _client_pkg:
-            _client_export.append(f"File: {_item['source_file']}")
-            for _req in _item["requests"]:
-                _client_export.append(f"- {_req}")
-            _client_export.append("")
-        st.download_button("Download client request list", data="\n".join(_client_export), file_name="client_follow_up_requests.txt", mime="text/plain")
+            _client_export = []
+            for _item in _client_pkg:
+                _client_export.append(f"File: {_item['source_file']}")
+                for _req in _item["requests"]:
+                    _client_export.append(f"- {(_req.get('flag_description') or _req.get('question_text'))}")
+                _client_export.append("")
+            st.download_button("Download client request list", data="\n".join(_client_export), file_name="client_follow_up_requests.txt", mime="text/plain")
     st.markdown("---")
 
 # Summary table
@@ -621,7 +623,7 @@ for r in raw_results:
         rd = ev.readiness
         row["readiness"] = rd.readiness_status if rd else ""
         row["blocking"]  = (rd.blocking_state == "blocking") if rd else False
-        row["q_count"]   = len(rd.questions) if rd else 0
+        row["q_count"]   = sum(1 for q in (rd.questions or []) if not q.resolved) if rd else 0
         summary_rows.append(row)
     except Exception:
         summary_rows.append({
@@ -686,7 +688,14 @@ for row in summary_rows:
     _rc[5].markdown(f"<small>{row.get('audit_areas','—')}</small>", unsafe_allow_html=True)
     _rc[6].markdown(f"<small>{row.get('confidence','—')}</small>", unsafe_allow_html=True)
     _qc = row.get("q_count", 0)
-    _rc[7].markdown(f"<small>{'⚠️ ' if _qc else ''}{_qc} Q</small>" if _qc else "<small>—</small>", unsafe_allow_html=True)
+    with _rc[7]:
+        if _qc:
+            if st.button(f"⚠️ {_qc} Q", key=f"summary_q_{fname}", help=f"Show open questions for {fname}"):
+                st.session_state["_summary_question_file"] = fname
+                st.session_state["_summary_question_open"] = True
+                st.rerun()
+        else:
+            st.markdown("<small>—</small>", unsafe_allow_html=True)
     with _rc[8]:
         if st.button("🗑", key=f"del_{fname}", help=f"Remove {fname} from results"):
             _new_results = [
@@ -697,6 +706,70 @@ for row in summary_rows:
             st.session_state["retry_selected"].discard(fname)
             st.session_state.pop(f"_upload_bytes_{fname}", None)
             st.rerun()
+
+_summary_question_file = st.session_state.get("_summary_question_file")
+if _summary_question_file:
+    _summary_match = next((x for x in raw_results if (x.get("evidence") or {}).get("source_file") == _summary_question_file), None)
+    if _summary_match:
+        try:
+            _summary_ev = AuditEvidence(**((_summary_match.get("evidence") or {})))
+        except Exception:
+            _summary_ev = None
+        if _summary_ev and _summary_ev.readiness and _summary_ev.readiness.questions:
+            _open_qs = [q for q in _summary_ev.readiness.questions if not q.resolved]
+            if _open_qs:
+                st.markdown("---")
+                with st.expander(f"Questions for {_summary_question_file} ({len(_open_qs)})", expanded=st.session_state.get("_summary_question_open", True)):
+                    _qq1, _qq2 = st.columns([6, 1])
+                    with _qq1:
+                        st.caption("Answer questions for this file here, or open the file for full detail.")
+                    with _qq2:
+                        if st.button("Hide", key=f"hide_summary_questions_{_summary_question_file}"):
+                            st.session_state.pop("_summary_question_file", None)
+                            st.session_state["_summary_question_open"] = False
+                            st.rerun()
+                    from audit_ingestion.readiness import resolve_question as _resolve_question_inline
+                    for _q in _open_qs:
+                        _qid = _q.question_id
+                        _detail = getattr(_q, "flag_description", None) or _q.question_text
+                        st.markdown(f"**{_detail}**")
+                        _sq = st.columns([3.2, 1.2, 0.9, 1])
+                        with _sq[0]:
+                            _ans = st.text_input(
+                                "Answer",
+                                key=f"summary_answer_{_summary_question_file}_{_qid}",
+                                placeholder="Type your answer or note here...",
+                                label_visibility="collapsed",
+                            )
+                        with _sq[1]:
+                            _rtype = st.selectbox(
+                                "Resolution type",
+                                ["answer", "reviewer_confirmed", "override", "dismissed"],
+                                key=f"summary_type_{_summary_question_file}_{_qid}",
+                                label_visibility="collapsed",
+                            )
+                        with _sq[2]:
+                            if st.button("Resolve", key=f"summary_resolve_{_summary_question_file}_{_qid}", type="primary"):
+                                def _apply_summary_resolution(_ev, _qid=_qid, _ans=_ans, _rtype=_rtype):
+                                    _resolve_question_inline(
+                                        _ev, _qid,
+                                        _ans or "resolved from document summary",
+                                        actor="reviewer",
+                                        resolution_type=_rtype,
+                                        comment=_ans or "resolved from document summary",
+                                    )
+                                _update_evidence_in_session(_summary_question_file, _apply_summary_resolution)
+                                _focus_document(_summary_question_file, _qid)
+                                st.session_state["_opened_from_queue"] = _summary_question_file
+                                st.rerun()
+                        with _sq[3]:
+                            if st.button("Open file", key=f"summary_open_{_summary_question_file}_{_qid}"):
+                                _focus_document(_summary_question_file, _qid)
+                                st.session_state["_opened_from_queue"] = _summary_question_file
+                                st.rerun()
+            else:
+                st.session_state.pop("_summary_question_file", None)
+                st.session_state["_summary_question_open"] = False
 
 st.markdown("---")
 
@@ -915,6 +988,8 @@ file_names = [r.get("evidence", {}).get("source_file", f"File {i}")
 if "detail_selected" not in st.session_state or st.session_state["detail_selected"] not in file_names:
     st.session_state["detail_selected"] = file_names[0] if file_names else None
 selected = st.selectbox("Select document to inspect", file_names, key="detail_selected")
+if st.session_state.get("_focus_question_id"):
+    st.caption("Focused from Questions to Resolve")
 
 r = next((x for x in raw_results
           if x.get("evidence", {}).get("source_file") == selected), None)
@@ -1496,16 +1571,32 @@ if ev.claims:
 
 # ── Section 4: Flags ──────────────────────────────────────────────────────────
 if ev.flags:
-    st.markdown('<div class="section-title">🚩 Flags & Exceptions</div>', unsafe_allow_html=True)
-    for flag in ev.flags:
-        severity = flag.severity
-        st.markdown(
-            f'<div class="flag-{severity}">'
-            f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
-            f'{flag.description}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+    _resolved_flag_types = {q.source_flag for q in (_rd.questions or []) if q.resolved and q.source_flag} if _rd else set()
+    _active_flags = [flag for flag in ev.flags if flag.type not in _resolved_flag_types]
+    _resolved_flags = [flag for flag in ev.flags if flag.type in _resolved_flag_types]
+    if _active_flags or _resolved_flags:
+        st.markdown('<div class="section-title">🚩 Flags & Exceptions</div>', unsafe_allow_html=True)
+    if _active_flags:
+        for flag in _active_flags:
+            severity = flag.severity
+            st.markdown(
+                f'<div class="flag-{severity}">'
+                f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
+                f'{flag.description}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    if _resolved_flags:
+        with st.expander(f"Resolved exceptions ({len(_resolved_flags)})", expanded=False):
+            for flag in _resolved_flags:
+                severity = flag.severity
+                st.markdown(
+                    f'<div class="flag-{severity}">'
+                    f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
+                    f'{flag.description}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
 
 # ── Section 5: Link Keys ──────────────────────────────────────────────────────
 lk = ev.link_keys

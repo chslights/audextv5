@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from typing import Optional
+import re
 from .models import AuditEvidence, Flag, Question, ReadinessResult
 from .workflow import record_question_event, utc_now_iso
 
@@ -284,6 +285,44 @@ _FINANCIAL_BLOCKING_OVERRIDES = {
 }
 
 
+def _format_financial_row_context(row: dict, source_file: str = "") -> str:
+    if not row:
+        return ""
+    row_num = row.get("row_index")
+    # rows are usually retained with first data row = 1; convert to CSV line number when possible
+    if isinstance(row_num, int):
+        display_row = row_num + 1 if row_num >= 1 else row_num
+    else:
+        display_row = row_num
+    parts = []
+    if display_row not in (None, ""):
+        parts.append(f"row {display_row}")
+    for label, key in (("Date", "transaction_date"), ("Account", "account_number"), ("Account", "account_name"), ("Description", "description"), ("Amount", "amount"), ("Debit", "debit"), ("Credit", "credit")):
+        val = row.get(key)
+        if val not in (None, "", "<NA>"):
+            parts.append(f"{label}: {val}")
+    return "; ".join(parts)
+
+
+def _enrich_flag_description(flag: Flag, evidence: AuditEvidence | None = None, fin_data: dict | None = None) -> str:
+    desc = (flag.description or "").strip()
+    if not evidence:
+        return desc
+    fin_data = fin_data or (evidence.document_specific or {}).get("_financial", {}) or {}
+    rows = fin_data.get("rows") or []
+    if flag.type == "duplicate_entry":
+        # Find the exact source row when a duplicate-posting note is embedded in GL text.
+        for row in rows:
+            hay = " ".join(str(row.get(k, "")) for k in ("description", "account_name", "account_number", "transaction_date", "amount")).lower()
+            if "duplicate" in hay:
+                row_ctx = _format_financial_row_context(row, evidence.source_file)
+                specific = f"Exact source row identified: {row_ctx}."
+                if desc and specific.lower() not in desc.lower():
+                    return f"{specific} {desc}".strip()
+                return specific
+    return desc
+
+
 def _make_question(flag: Flag, rule: dict, is_financial: bool = False) -> Question:
     """Build a Question from a flag and its rule."""
     blocking = rule["blocking"]
@@ -366,6 +405,9 @@ def compute_readiness(evidence: AuditEvidence) -> ReadinessResult:
     """
     flags      = evidence.flags or []
     fin_data   = (evidence.document_specific or {}).get("_financial", {})
+    # Refresh any file-specific flag descriptions so questions can show exact context.
+    for _flag in flags:
+        _flag.description = _enrich_flag_description(_flag, evidence=evidence, fin_data=fin_data)
     is_financial = bool(
         fin_data and fin_data.get("doc_type") and
         fin_data["doc_type"] != "not_financial_structured_data"

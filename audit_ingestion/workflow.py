@@ -159,6 +159,20 @@ def record_question_event(evidence: AuditEvidence, question: Question, actor: st
     evidence.document_specific["_workflow"] = wf
 
 
+def _flag_description_for_question(ev: AuditEvidence, q: Question) -> str:
+    for flag in ev.flags or []:
+        if flag.type == q.source_flag:
+            return flag.description or ""
+    return ""
+
+
+def _active_question_count(ev: AuditEvidence) -> int:
+    rd = ev.readiness
+    if not rd:
+        return 0
+    return sum(1 for q in (rd.questions or []) if not q.resolved)
+
+
 def build_prioritized_action_queue(evidence_items: list[AuditEvidence]) -> list[dict[str, Any]]:
     queue: list[dict[str, Any]] = []
     for ev in evidence_items:
@@ -177,6 +191,7 @@ def build_prioritized_action_queue(evidence_items: list[AuditEvidence]) -> list[
                 "blocking": q.blocking,
                 "readiness_status": rd.readiness_status,
                 "source_flag": q.source_flag,
+                "flag_description": _flag_description_for_question(ev, q),
                 "priority_label": "Blocking" if q.blocking else "Review",
             })
     queue.sort(key=lambda item: (
@@ -207,7 +222,15 @@ def build_client_followup_package(evidence_items: list[AuditEvidence]) -> list[d
             "source_file": ev.source_file,
             "request_count": len(client_questions),
             "blocking_count": sum(1 for q in client_questions if q.blocking),
-            "requests": [q.question_text for q in client_questions],
+            "requests": [
+                {
+                    "question_text": q.question_text,
+                    "flag_description": _flag_description_for_question(ev, q),
+                    "question_id": q.question_id,
+                    "source_flag": q.source_flag,
+                }
+                for q in client_questions
+            ],
         })
     package.sort(key=lambda item: (-item["blocking_count"], -item["request_count"], item["source_file"].lower()))
     return package
