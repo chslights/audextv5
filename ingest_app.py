@@ -584,7 +584,10 @@ if _action_queue:
             for _item in _client_pkg:
                 st.markdown(f"**{_item['source_file']}** — {_item['request_count']} open client request(s), {_item['blocking_count']} blocking")
                 for _req in _item["requests"]:
-                    _req_text = _req.get("flag_description") or _req.get("question_text")
+                    if isinstance(_req, dict):
+                        _req_text = _req.get("flag_description") or _req.get("question_text") or str(_req)
+                    else:
+                        _req_text = str(_req)
                     st.markdown(f"- {_req_text}")
                 if st.button("Open file", key=f"client_pkg_open_{_item['source_file']}"):
                     _focus_document(_item['source_file'])
@@ -594,7 +597,11 @@ if _action_queue:
             for _item in _client_pkg:
                 _client_export.append(f"File: {_item['source_file']}")
                 for _req in _item["requests"]:
-                    _client_export.append(f"- {(_req.get('flag_description') or _req.get('question_text'))}")
+                    if isinstance(_req, dict):
+                        _req_text = _req.get('flag_description') or _req.get('question_text') or str(_req)
+                    else:
+                        _req_text = str(_req)
+                    _client_export.append(f"- {_req_text}")
                 _client_export.append("")
             st.download_button("Download client request list", data="\n".join(_client_export), file_name="client_follow_up_requests.txt", mime="text/plain")
     st.markdown("---")
