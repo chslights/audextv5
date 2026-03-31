@@ -510,7 +510,7 @@ m4.metric("❌ Failed", failed)
 
 st.markdown("---")
 
-# Action queue
+# Light question guidance — use the summary badge to open file-specific questions.
 from audit_ingestion.readiness import resolve_question
 _evidence_items_for_queue = []
 for _r in raw_results:
@@ -519,92 +519,15 @@ for _r in raw_results:
         _evidence_items_for_queue.append(AuditEvidence(**_ev_data))
     except Exception:
         pass
-_action_queue = build_prioritized_action_queue(_evidence_items_for_queue)
 _next_best = next_best_question(_evidence_items_for_queue)
 if _next_best:
     _best_detail = _next_best.get("flag_description") or _next_best["question_text"]
     st.info(f"Next best item: {_next_best['source_file']} — {_best_detail}")
+    st.caption("Click the yellow question badge in Document Summary to answer only the questions for that file.")
 if st.session_state.get("_opened_from_queue"):
     st.success(f"Opened {st.session_state['_opened_from_queue']} below in Document Detail.")
     st.session_state.pop("_opened_from_queue")
-if _action_queue:
-    st.markdown('<div class="section-title">Questions to Resolve</div>', unsafe_allow_html=True)
-    st.caption("Keep this section light: answer quick items here, or open the file detail below when you need more context.")
-    with st.expander(f"Open question queue ({len(_action_queue)})", expanded=False):
-        for _item in _action_queue:
-            _qkey = _item["question_id"]
-            _source_file = _item["source_file"]
-            _priority = _item["priority_label"]
-            _aud = _item["audience"]
-            _blocking_label = "Blocking" if _item["blocking"] else "Review"
-            _detail = _item.get("flag_description") or _item["question_text"]
-            _exp_label = f"{_source_file} · {_blocking_label} · {_aud}"
-            with st.expander(_exp_label, expanded=False):
-                st.markdown(f"**{_item['question_text']}**")
-                if _detail and _detail != _item["question_text"]:
-                    st.caption(_detail)
-                _cols = st.columns([3, 1.2, 1, 1])
-                with _cols[0]:
-                    _queue_answer = st.text_input(
-                        "Answer",
-                        key=f"queue_answer_{_source_file}_{_qkey}",
-                        placeholder="Type your answer or note here...",
-                        label_visibility="collapsed",
-                    )
-                with _cols[1]:
-                    _queue_type = st.selectbox(
-                        "Resolution type",
-                        ["answer", "reviewer_confirmed", "override", "dismissed"],
-                        key=f"queue_type_{_source_file}_{_qkey}",
-                        label_visibility="collapsed",
-                    )
-                with _cols[2]:
-                    if st.button("Resolve", key=f"queue_resolve_{_source_file}_{_qkey}", type="primary"):
-                        def _apply_queue_resolution(_ev, _qid=_qkey, _ans=_queue_answer, _rtype=_queue_type, _aud=_aud):
-                            resolve_question(
-                                _ev, _qid,
-                                _ans or "resolved from questions to resolve",
-                                actor="reviewer",
-                                resolution_type=_rtype,
-                                comment=_ans or "resolved from questions to resolve",
-                            )
-                        _update_evidence_in_session(_source_file, _apply_queue_resolution)
-                        _focus_document(_source_file, _qkey)
-                        st.session_state["_opened_from_queue"] = _source_file
-                        st.rerun()
-                with _cols[3]:
-                    if st.button("Open file", key=f"queue_open_{_source_file}_{_qkey}"):
-                        _focus_document(_source_file, _qkey)
-                        st.session_state["_opened_from_queue"] = _source_file
-                        st.rerun()
-
-    _client_pkg = build_client_followup_package(_evidence_items_for_queue)
-    if _client_pkg:
-        with st.expander(f"Client follow-up package ({sum(_i['request_count'] for _i in _client_pkg)})", expanded=False):
-            for _item in _client_pkg:
-                st.markdown(f"**{_item['source_file']}** — {_item['request_count']} open client request(s), {_item['blocking_count']} blocking")
-                for _req in _item["requests"]:
-                    if isinstance(_req, dict):
-                        _req_text = _req.get("flag_description") or _req.get("question_text") or str(_req)
-                    else:
-                        _req_text = str(_req)
-                    st.markdown(f"- {_req_text}")
-                if st.button("Open file", key=f"client_pkg_open_{_item['source_file']}"):
-                    _focus_document(_item['source_file'])
-                    st.session_state["_opened_from_queue"] = _item['source_file']
-                    st.rerun()
-            _client_export = []
-            for _item in _client_pkg:
-                _client_export.append(f"File: {_item['source_file']}")
-                for _req in _item["requests"]:
-                    if isinstance(_req, dict):
-                        _req_text = _req.get('flag_description') or _req.get('question_text') or str(_req)
-                    else:
-                        _req_text = str(_req)
-                    _client_export.append(f"- {_req_text}")
-                _client_export.append("")
-            st.download_button("Download client request list", data="\n".join(_client_export), file_name="client_follow_up_requests.txt", mime="text/plain")
-    st.markdown("---")
+st.markdown("---")
 
 # Summary table
 st.markdown('<div class="section-title">Document Summary</div>', unsafe_allow_html=True)
@@ -738,8 +661,11 @@ if _summary_question_file:
                     from audit_ingestion.readiness import resolve_question as _resolve_question_inline
                     for _q in _open_qs:
                         _qid = _q.question_id
-                        _detail = getattr(_q, "flag_description", None) or _q.question_text
-                        st.markdown(f"**{_detail}**")
+                        _matching_flag = next((f for f in (_summary_ev.flags or []) if f.type == _q.source_flag), None)
+                        _detail = (_matching_flag.description if _matching_flag else "") or _q.question_text
+                        st.markdown(f"**{_q.question_text}**")
+                        if _detail and _detail != _q.question_text:
+                            st.caption(f"What was found: {_detail}")
                         _sq = st.columns([3.2, 1.2, 0.9, 1])
                         with _sq[0]:
                             _ans = st.text_input(

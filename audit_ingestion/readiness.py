@@ -18,7 +18,7 @@ import logging
 import uuid
 from typing import Optional
 import re
-from .models import AuditEvidence, Flag, Question, ReadinessResult
+from .models import AuditEvidence, AuditOverview, AuditPeriod, Flag, Question, ReadinessResult
 from .workflow import record_question_event, utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -350,6 +350,61 @@ def build_action_queue(evidence_items: list[AuditEvidence]) -> list[dict]:
     return build_prioritized_action_queue(evidence_items)
 
 
+
+
+def _remove_flag(evidence: AuditEvidence, flag_type: str | None) -> None:
+    if not flag_type:
+        return
+    evidence.flags = [f for f in (evidence.flags or []) if f.type != flag_type]
+
+
+def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, resolution: str) -> None:
+    ensure = (evidence.document_specific or {}).setdefault("_workflow", {})
+    overrides = ensure.setdefault("field_overrides", {})
+    answer = (resolution or "").strip()
+    if question.question_type == "period_confirmation" and answer:
+        if not evidence.audit_overview:
+            evidence.audit_overview = AuditOverview(summary=evidence.title or evidence.source_file, period=AuditPeriod())
+        elif not evidence.audit_overview.period:
+            evidence.audit_overview.period = AuditPeriod()
+        evidence.audit_overview.period.effective_date = answer
+        overrides["period_effective_date"] = answer
+        fin = (evidence.document_specific or {}).setdefault("_financial", {})
+        fin["period_start"] = answer
+        overrides["financial_period_start"] = answer
+        _remove_flag(evidence, question.source_flag)
+    elif question.question_type == "current_vs_prior_year_confirmation" and answer:
+        normalized = answer.lower()
+        finality = "prior_year" if "prior" in normalized else "current_year" if "current" in normalized else ""
+        fin = (evidence.document_specific or {}).setdefault("_financial", {})
+        if finality:
+            fin["finality_state"] = finality
+            overrides["financial_finality_state"] = finality
+            if (evidence.subtype or "").startswith("trial_balance"):
+                evidence.subtype = f"trial_balance_{finality}"
+                overrides["subtype"] = evidence.subtype
+        _remove_flag(evidence, question.source_flag)
+    elif question.resolution_type in ("override", "dismissed", "reviewer_confirmed") or question.audience == "reviewer":
+        _remove_flag(evidence, question.source_flag)
+    elif question.source_flag == "duplicate_entry" and answer:
+        # keep exact answer in workflow, but remove active blocker so summary updates after explanation/correction
+        _remove_flag(evidence, question.source_flag)
+
+
+def _rebuild_readiness_with_history(evidence: AuditEvidence, resolved_history: list[Question]) -> ReadinessResult:
+    new_rd = compute_readiness(evidence)
+    unresolved = list(new_rd.questions or [])
+    preserved = []
+    seen = set()
+    for q in resolved_history:
+        key = (q.source_flag, q.question_type, q.resolution or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        preserved.append(q)
+    new_rd.questions = unresolved + preserved
+    return new_rd
+
 def resolve_question(
     evidence: AuditEvidence,
     question_id: str,
@@ -359,10 +414,11 @@ def resolve_question(
     resolution_type: str = "answer",
     comment: str | None = None,
 ) -> AuditEvidence:
-    """Resolve a question in-place and recalculate readiness for the evidence."""
+    """Resolve a question in-place, apply field updates, and recalculate readiness."""
     if not evidence.readiness:
         evidence.readiness = compute_readiness(evidence)
 
+    resolved_question = None
     for q in evidence.readiness.questions or []:
         if q.question_id == question_id:
             q.resolved = True
@@ -375,26 +431,15 @@ def resolve_question(
             q.resolved_at = utc_now_iso()
             q.comments = comment or resolution
             record_question_event(evidence, q, actor=actor, action=q.status, comment=q.comments)
+            resolved_question = q.model_copy(deep=True)
+            _apply_resolution_side_effects(evidence, q, resolution)
             break
 
-    unresolved = [q for q in evidence.readiness.questions if not q.resolved]
-    blocking_questions = [q for q in unresolved if q.blocking]
-    reviewer_blocking = [q for q in blocking_questions if q.audience == "reviewer"]
-    client_blocking = [q for q in blocking_questions if q.audience == "client"]
-    any_non_blocking = [q for q in unresolved if not q.blocking]
+    resolved_history = [q.model_copy(deep=True) for q in (evidence.readiness.questions or []) if q.resolved]
+    if resolved_question and all((rq.question_id != resolved_question.question_id) for rq in resolved_history):
+        resolved_history.append(resolved_question)
 
-    if blocking_questions:
-        if reviewer_blocking:
-            evidence.readiness.readiness_status = "needs_reviewer_confirmation"
-        elif client_blocking:
-            evidence.readiness.readiness_status = "needs_client_answer"
-    elif any_non_blocking:
-        evidence.readiness.readiness_status = "exception_open"
-    else:
-        evidence.readiness.readiness_status = "ready"
-
-    evidence.readiness.blocking_state = "blocking" if blocking_questions else "non_blocking"
-    evidence.readiness.blocking_issues = [q.source_flag for q in blocking_questions if q.source_flag]
+    evidence.readiness = _rebuild_readiness_with_history(evidence, resolved_history)
     return evidence
 
 

@@ -70,6 +70,7 @@ def ensure_workflow_metadata(evidence: AuditEvidence, file_signature: str | None
     wf.setdefault("created_at", utc_now_iso())
     wf.setdefault("lineage", {})
     wf.setdefault("question_history", [])
+    wf.setdefault("field_overrides", {})
     ds["_workflow"] = wf
     evidence.document_specific = ds
     return evidence
@@ -100,9 +101,53 @@ def merge_state_into_evidence(evidence: AuditEvidence, file_signature: str | Non
             q.comments = item.get("comments")
     wf.setdefault("question_history", saved.get("question_history", []))
     wf.setdefault("lineage", saved.get("lineage", {}))
+    overrides = saved.get("field_overrides", {}) or wf.get("field_overrides", {})
+    wf["field_overrides"] = overrides
     evidence.document_specific["_workflow"] = wf
+    _apply_field_overrides(evidence, overrides)
+    if overrides and evidence.readiness:
+        from .readiness import compute_readiness
+        resolved_history = []
+        for item in saved.get("questions", []):
+            if item.get("resolved"):
+                try:
+                    resolved_history.append(Question(**item))
+                except Exception:
+                    pass
+        new_rd = compute_readiness(evidence)
+        unresolved = list(new_rd.questions or [])
+        for rq in resolved_history:
+            unresolved.append(rq)
+        new_rd.questions = unresolved
+        evidence.readiness = new_rd
     return evidence
 
+
+
+
+def _apply_field_overrides(evidence: AuditEvidence, overrides: dict[str, Any]) -> AuditEvidence:
+    if not overrides:
+        return evidence
+    if overrides.get("period_effective_date"):
+        if not evidence.audit_overview:
+            from .models import AuditOverview, AuditPeriod
+            evidence.audit_overview = AuditOverview(summary=evidence.title or evidence.source_file, period=AuditPeriod())
+        elif not evidence.audit_overview.period:
+            from .models import AuditPeriod
+            evidence.audit_overview.period = AuditPeriod()
+        evidence.audit_overview.period.effective_date = overrides.get("period_effective_date")
+        evidence.flags = [f for f in (evidence.flags or []) if f.type != "missing_period"]
+    fin = (evidence.document_specific or {}).setdefault("_financial", {})
+    if overrides.get("financial_period_start"):
+        fin["period_start"] = overrides.get("financial_period_start")
+    if overrides.get("financial_period_end"):
+        fin["period_end"] = overrides.get("financial_period_end")
+    if overrides.get("financial_finality_state"):
+        fin["finality_state"] = overrides.get("financial_finality_state")
+        evidence.flags = [f for f in (evidence.flags or []) if f.type != "tb_year_unconfirmed"]
+    if overrides.get("subtype"):
+        evidence.subtype = overrides.get("subtype")
+    return evidence
 
 def persist_evidence_state(evidence: AuditEvidence, state: dict[str, Any] | None = None, path: Path | None = None) -> dict[str, Any]:
     state = deepcopy(state or load_state(path))
@@ -116,6 +161,7 @@ def persist_evidence_state(evidence: AuditEvidence, state: dict[str, Any] | None
         "questions": [_question_to_dict(q) for q in (evidence.readiness.questions if evidence.readiness else [])],
         "question_history": wf.get("question_history", []),
         "lineage": wf.get("lineage", {}),
+        "field_overrides": wf.get("field_overrides", {}),
     }
     save_state(state, path)
     return state
