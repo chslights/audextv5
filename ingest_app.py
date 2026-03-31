@@ -480,6 +480,63 @@ def _update_evidence_in_session(source_file: str, updater):
         st.session_state["v05_results"][idx]["evidence"] = ev.model_dump()
 
 
+def _question_detail(ev, q):
+    _matching_flag = next((f for f in (ev.flags or []) if f.type == q.source_flag), None)
+    return ((_matching_flag.description if _matching_flag else "") or q.question_text).strip()
+
+
+def _matching_bulk_targets(source_file: str, question_type: str, source_flag: str | None):
+    from audit_ingestion.models import AuditEvidence
+    targets = []
+    for result in st.session_state.get("v05_results", []):
+        ev_data = result.get("evidence") or {}
+        fname = ev_data.get("source_file")
+        if not fname or fname == source_file:
+            continue
+        try:
+            ev = AuditEvidence(**ev_data)
+        except Exception:
+            continue
+        rd = ev.readiness
+        if not rd:
+            continue
+        for q in rd.questions or []:
+            if q.resolved:
+                continue
+            if q.question_type == question_type and q.source_flag == source_flag:
+                targets.append(fname)
+                break
+    return sorted(set(targets))
+
+
+def _resolve_matching_questions_bulk(source_files, question_type: str, source_flag: str | None, resolution: str, resolution_type: str):
+    from audit_ingestion.readiness import resolve_question as _resolve_question_inline
+    from audit_ingestion.models import AuditEvidence
+    for fname in source_files:
+        for idx, result in enumerate(st.session_state.get("v05_results", [])):
+            ev_data = result.get("evidence") or {}
+            if ev_data.get("source_file") != fname:
+                continue
+            ev = AuditEvidence(**ev_data)
+            rd = ev.readiness
+            if not rd:
+                continue
+            target_q = next((q for q in (rd.questions or []) if (not q.resolved) and q.question_type == question_type and q.source_flag == source_flag), None)
+            if not target_q:
+                continue
+            _resolve_question_inline(
+                ev,
+                target_q.question_id,
+                resolution or "resolved in bulk",
+                actor="reviewer",
+                resolution_type=resolution_type,
+                comment=resolution or "resolved in bulk",
+            )
+            persist_evidence_state(ev)
+            st.session_state["v05_results"][idx]["evidence"] = ev.model_dump()
+            break
+
+
 def _focus_document(source_file: str, question_id: str | None = None):
     st.session_state["detail_selected"] = source_file
     if question_id:
@@ -661,12 +718,23 @@ if _summary_question_file:
                     from audit_ingestion.readiness import resolve_question as _resolve_question_inline
                     for _q in _open_qs:
                         _qid = _q.question_id
-                        _matching_flag = next((f for f in (_summary_ev.flags or []) if f.type == _q.source_flag), None)
-                        _detail = (_matching_flag.description if _matching_flag else "") or _q.question_text
+                        _detail = _question_detail(_summary_ev, _q)
+                        _bulk_targets = _matching_bulk_targets(_summary_question_file, _q.question_type, _q.source_flag)
                         st.markdown(f"**{_q.question_text}**")
                         if _detail and _detail != _q.question_text:
                             st.caption(f"What was found: {_detail}")
-                        _sq = st.columns([3.2, 1.2, 0.9, 1])
+                        if _bulk_targets:
+                            _default_targets = _bulk_targets if len(_bulk_targets) <= 5 else []
+                            _apply_files = st.multiselect(
+                                "Also apply to matching files",
+                                _bulk_targets,
+                                default=_default_targets,
+                                key=f"summary_apply_{_summary_question_file}_{_qid}",
+                                help="Use this when multiple files raise the same question.",
+                            )
+                        else:
+                            _apply_files = []
+                        _sq = st.columns([3.0, 1.2, 0.9, 1])
                         with _sq[0]:
                             _ans = st.text_input(
                                 "Answer",
@@ -692,6 +760,8 @@ if _summary_question_file:
                                         comment=_ans or "resolved from document summary",
                                     )
                                 _update_evidence_in_session(_summary_question_file, _apply_summary_resolution)
+                                if _apply_files:
+                                    _resolve_matching_questions_bulk(_apply_files, _q.question_type, _q.source_flag, _ans or "resolved from document summary", _rtype)
                                 _focus_document(_summary_question_file, _qid)
                                 st.session_state["_opened_from_queue"] = _summary_question_file
                                 st.rerun()
@@ -939,38 +1009,6 @@ except Exception as e:
 meta = ev.extraction_meta
 overview = ev.audit_overview
 
-# ── Extraction Diagnostics ────────────────────────────────────────────────────
-with st.expander("🔬 Extraction Diagnostics", expanded=True):
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Extractor", meta.primary_extractor)
-    d2.metric("Pages", meta.pages_processed)
-    d3.metric("Total Chars", f"{meta.total_chars:,}")
-    d4.metric("Confidence", f"{meta.overall_confidence:.2f}")
-
-    d5, d6, d7, d8 = st.columns(4)
-    d5.metric("Weak Pages", meta.weak_pages_count)
-    d6.metric("OCR Pages", meta.ocr_pages_count)
-    d7.metric("Vision Pages", meta.vision_pages_count)
-    d8.metric("Needs Review", "Yes" if meta.needs_human_review else "No")
-
-    if meta.warnings:
-        st.warning("**Warnings:** " + " | ".join(meta.warnings))
-    if meta.errors:
-        st.error("**Errors:** " + " | ".join(meta.errors))
-
-    # Engine chain
-    chain = r.get("engine_chain", [])
-    if chain:
-        st.markdown(f"**Engine Chain:** `{' → '.join(chain)}`")
-
-    # Per-stage timing
-    doc_specific = ev_data.get("document_specific") or {}
-    stage_timings = doc_specific.get("_stage_timings")
-    if stage_timings:
-        timing_cols = st.columns(len(stage_timings))
-        for i, (stage, t) in enumerate(stage_timings.items()):
-            timing_cols[i].metric(stage.replace("_", " ").title(), f"{t:.2f}s")
-
 # ── Section 1: Auditor Snapshot ───────────────────────────────────────────────
 if overview:
     st.markdown('<div class="section-title">🔍 Auditor Snapshot</div>', unsafe_allow_html=True)
@@ -1099,7 +1137,7 @@ if overview:
             )
 
         # ── Step 1: Detected Type ─────────────────────────────────────────────
-        st.markdown("**Step 1 — Document Type**")
+        st.markdown("**Document Type**")
         _conf_color = "#16a34a" if _fconf >= 0.85 else ("#d97706" if _fconf >= 0.70 else "#dc2626")
         _c1, _c2 = st.columns([3, 2])
         _c1.markdown(
@@ -1110,7 +1148,7 @@ if overview:
         )
 
         # ── Step 2: Period ────────────────────────────────────────────────────
-        st.markdown("**Step 2 — Period Covered**")
+        st.markdown("**Period Covered**")
         if _fperiod_start:
             _period_str = _fperiod_start if (_fperiod_start == _fperiod_end or not _fperiod_end)                           else f"{_fperiod_start} – {_fperiod_end}"
             _psrc = _fin.get("period_source", "")
@@ -1126,7 +1164,7 @@ if overview:
 
         # ── Step 3: Sheet (Excel only) ────────────────────────────────────────
         if _sheet_count > 1:
-            st.markdown("**Step 3 — Excel Sheet**")
+            st.markdown("**Workbook Sheet**")
             _sh_cols = st.columns([3, 2])
             _sh_cols[0].markdown(
                 f"Using sheet: **{_sheet_name}** &nbsp; "
@@ -1153,7 +1191,7 @@ if overview:
         _display_totals = {k: v for k, v in _ftotals.items()
                            if not k.endswith("_error") and isinstance(v, (int, float))}
         if _display_totals:
-            st.markdown("**Step 4 — Key Totals**")
+            st.markdown("**Key Totals**")
             _tcols = st.columns(min(4, len(_display_totals)))
             for _ti, (_tk, _tv) in enumerate(list(_display_totals.items())[:4]):
                 _tcols[_ti].metric(_tk.replace("_", " ").title(), f"${_tv:,.0f}")
@@ -1207,7 +1245,7 @@ if overview:
                 st.dataframe(pd.DataFrame(_top_rows), use_container_width=True, hide_index=True)
 
         # ── Step 7: Confirm / Override ────────────────────────────────────────
-        st.markdown("**Step 7 — Confirm or Correct**")
+        st.markdown("**Review and Confirm**")
 
         # TB year fast-path
         if _ftype == "trial_balance_unknown_year":
@@ -1339,11 +1377,8 @@ if _rd:
                 _q_border = "#93c5fd" if _q.audience == "reviewer" else "#fcd34d"
                 _block_tag = " <span style='color:#dc2626;font-size:0.75rem;font-weight:600'>[BLOCKING]</span>" if _q.blocking else ""
 
-                # Find the matching flag to get its description (the AI-extracted context)
-                _matching_flag = next(
-                    (f for f in ev.flags if f.type == _q.source_flag), None
-                )
-                _flag_context = _matching_flag.description if _matching_flag else ""
+                _flag_context = _question_detail(ev, _q)
+                _bulk_targets = _matching_bulk_targets(selected, _q.question_type, _q.source_flag)
 
                 if _focused_qid == _q.question_id:
                     st.caption("Focused from Questions to Resolve")
@@ -1363,6 +1398,17 @@ if _rd:
                     unsafe_allow_html=True
                 )
                 if not _q.resolved:
+                    if _bulk_targets:
+                        _default_targets = _bulk_targets if len(_bulk_targets) <= 5 else []
+                        _apply_files = st.multiselect(
+                            "Also apply to matching files",
+                            _bulk_targets,
+                            default=_default_targets,
+                            key=f"detail_apply_{selected}_{_q.question_id}",
+                            help="Apply the same answer to other files with the same question type.",
+                        )
+                    else:
+                        _apply_files = []
                     _resolution = st.text_input(
                         "Your answer",
                         key=f"resolution_{selected}_{_q.question_id}",
@@ -1389,6 +1435,8 @@ if _rd:
                                     comment=_res or "resolved in app",
                                 )
                             _update_evidence_in_session(selected, _apply_resolution)
+                            if _apply_files:
+                                _resolve_matching_questions_bulk(_apply_files, _q.question_type, _q.source_flag, _resolution or "resolved in app", _resolution_type)
                             st.rerun()
                 else:
                     st.markdown(
@@ -1565,6 +1613,39 @@ if ev.tables:
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 except Exception:
                     st.json(rows[:5])
+
+# ── Extraction Diagnostics ────────────────────────────────────────────────────
+with st.expander("🔬 Extraction Diagnostics", expanded=False):
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Extractor", meta.primary_extractor)
+    d2.metric("Pages", meta.pages_processed)
+    d3.metric("Total Chars", f"{meta.total_chars:,}")
+    d4.metric("Confidence", f"{meta.overall_confidence:.2f}")
+
+    d5, d6, d7, d8 = st.columns(4)
+    d5.metric("Weak Pages", meta.weak_pages_count)
+    d6.metric("OCR Pages", meta.ocr_pages_count)
+    d7.metric("Vision Pages", meta.vision_pages_count)
+    d8.metric("Needs Review", "Yes" if meta.needs_human_review else "No")
+
+    if meta.warnings:
+        st.warning("**Warnings:** " + " | ".join(meta.warnings))
+    if meta.errors:
+        st.error("**Errors:** " + " | ".join(meta.errors))
+
+    # Engine chain
+    chain = r.get("engine_chain", [])
+    if chain:
+        st.markdown(f"**Engine Chain:** `{' → '.join(chain)}`")
+
+    # Per-stage timing
+    doc_specific = ev_data.get("document_specific") or {}
+    stage_timings = doc_specific.get("_stage_timings")
+    if stage_timings:
+        timing_cols = st.columns(len(stage_timings))
+        for i, (stage, t) in enumerate(stage_timings.items()):
+            timing_cols[i].metric(stage.replace("_", " ").title(), f"{t:.2f}s")
+
 
 # ── Section 8: Raw Text by Page ───────────────────────────────────────────────
 if ev.raw_text:

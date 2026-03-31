@@ -183,7 +183,11 @@ def ingest_one(
         evidence.document_specific["_stage_timings"] = stage_timings
         return IngestionResult(
             source_file=path,
-            status="partial",
+            # Classification may still need reviewer confirmation, but the file
+            # was successfully processed and financial facts were extracted.
+            # Showing this as partial confuses users into thinking data is
+            # missing or extraction failed.
+            status="success",
             evidence=evidence,
             errors=errors,
             engine_chain=engine_chain,
