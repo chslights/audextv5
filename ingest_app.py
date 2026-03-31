@@ -1000,6 +1000,7 @@ if not r:
     st.stop()
 
 ev_data = r.get("evidence") or {}
+doc_specific = ev_data.get("document_specific") or {}
 try:
     ev = AuditEvidence(**ev_data)
 except Exception as e:
@@ -1639,7 +1640,6 @@ with st.expander("🔬 Extraction Diagnostics", expanded=False):
         st.markdown(f"**Engine Chain:** `{' → '.join(chain)}`")
 
     # Per-stage timing
-    doc_specific = ev_data.get("document_specific") or {}
     stage_timings = doc_specific.get("_stage_timings")
     if stage_timings:
         timing_cols = st.columns(len(stage_timings))
