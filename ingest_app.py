@@ -1078,6 +1078,10 @@ if _os.path.isdir(_cache_dir):
     _cache_files = [f for f in _os.listdir(_cache_dir) if f.endswith(".json")]
 st.caption(f"Disk cache: {len(_cache_files)} result(s) stored")
 
+file_names = [row.get("file", "?") for row in summary_rows] if summary_rows else [((raw_results[0].get("evidence") or {}).get("source_file", "?"))] if raw_results else []
+if not file_names:
+    st.info("No processed documents available to inspect yet.")
+    st.stop()
 selected = st.selectbox("Select document to inspect", file_names, key="detail_selected")
 if st.session_state.get("_focus_question_id"):
     st.caption("Focused from Questions to Resolve")
