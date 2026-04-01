@@ -21,11 +21,13 @@ from audit_ingestion.workflow import (
     next_best_question,
     persist_evidence_state,
     register_lineage,
+    load_state,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 BUILD_VERSION = "v05.1"
+DISPLAY_BUILD_VERSION = "V.05.30"
 
 st.set_page_config(
     page_title="Audit Ingestion v05",
@@ -73,6 +75,157 @@ st.markdown("""
 .prov-quote { font-style: italic; color: #6b7280; font-size: 0.8rem; }
 </style>
 """, unsafe_allow_html=True)
+
+def _is_rent_receipt_name(name: str) -> bool:
+    n = (name or "").lower()
+    return "rent_receipt" in n or ("rent" in n and "receipt" in n)
+
+
+def _question_cluster(question_type: str | None, source_flag: str | None) -> str:
+    qt = question_type or ""
+    sf = source_flag or ""
+    if qt in {"missing_agreement_request", "missing_attachment_request"} or sf in {"reference_to_underlying_agreement", "reference_to_other_agreement", "attachment_reference"}:
+        return "agreement_dependency"
+    return f"{qt}::{sf}"
+
+def _resolution_badge(ev) -> str:
+    rd = getattr(ev, "readiness", None)
+    wf = (getattr(ev, "document_specific", {}) or {}).get("_workflow", {}) or {}
+    hist = list(wf.get("question_history") or [])
+    resolved = [q for q in (rd.questions or []) if getattr(q, "resolved", False)] if rd else []
+    if not hist and not resolved and not (wf.get("resolved_exceptions") or []):
+        return "Original" if rd and rd.readiness_status == "ready" else "—"
+    if rd and rd.readiness_status == "ready":
+        kinds = {q.question_type for q in resolved}
+        audiences = {q.audience for q in resolved}
+        if "current_vs_prior_year_confirmation" in kinds:
+            return "Reviewer Confirmed"
+        if "period_confirmation" in kinds:
+            return "Client Answer Resolved"
+        if any(_question_cluster(q.question_type, q.source_flag) == "agreement_dependency" for q in resolved):
+            return "Exception Closed"
+        if "client" in audiences:
+            return "Client Answer Resolved"
+        if "reviewer" in audiences:
+            return "Reviewer Confirmed"
+        return "Resolved"
+    return "—"
+
+
+def _question_input_spec(q, detail: str = ""):
+    qt = (getattr(q, "question_type", "") or "").strip()
+    cluster = _question_cluster(qt, getattr(q, "source_flag", None))
+    if qt == "current_vs_prior_year_confirmation":
+        return {"kind": "select", "options": ["", "Current-year trial balance", "Prior-year trial balance"]}
+    if qt == "period_confirmation":
+        return {"kind": "period"}
+    if cluster == "agreement_dependency":
+        return {"kind": "select", "options": ["", "Agreement uploaded separately", "Not needed for this file", "Still missing — request from client"]}
+    if getattr(q, "audience", "reviewer") == "reviewer":
+        return {"kind": "select", "options": ["", "No further action needed", "Disclosure required", "Additional testing required", "Tracked in workpapers"]}
+    return {"kind": "text"}
+
+
+def _render_question_answer_controls(prefix: str, q, detail: str = ""):
+    spec = _question_input_spec(q, detail)
+    kind = spec.get("kind")
+    if kind == "select":
+        return st.selectbox("Answer", spec["options"], key=f"{prefix}_answer", label_visibility="collapsed")
+    if kind == "period":
+        mode = st.selectbox("Period format", ["Fiscal year", "Date range"], key=f"{prefix}_period_mode", label_visibility="collapsed")
+        if mode == "Fiscal year":
+            years = [""] + [str(y) for y in range(2020, 2031)]
+            return st.selectbox("Fiscal year", years, key=f"{prefix}_period_year", label_visibility="collapsed")
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.text_input("Start date", key=f"{prefix}_period_start", placeholder="YYYY-MM-DD", label_visibility="collapsed")
+        with c2:
+            end = st.text_input("End date", key=f"{prefix}_period_end", placeholder="YYYY-MM-DD", label_visibility="collapsed")
+        return f"{start} to {end}" if start and end else ""
+    return st.text_input("Answer", key=f"{prefix}_answer", placeholder="Type your answer or note here...", label_visibility="collapsed")
+
+
+def _inherit_shared_resolution(ev):
+    if not getattr(ev, "readiness", None):
+        return ev
+    open_qs = [q for q in (ev.readiness.questions or []) if not q.resolved]
+    if not open_qs:
+        return ev
+    state = load_state()
+    resolved_by_cluster = {}
+    for _sig, saved in (state.get("files") or {}).items():
+        src = saved.get("source_file", "")
+        if src == ev.source_file:
+            continue
+        if _is_rent_receipt_name(ev.source_file) and not _is_rent_receipt_name(src):
+            continue
+        for item in saved.get("questions", []) or []:
+            if not item.get("resolved"):
+                continue
+            cl = _question_cluster(item.get("question_type"), item.get("source_flag"))
+            resolved_by_cluster.setdefault(cl, item)
+    if not resolved_by_cluster:
+        return ev
+    from audit_ingestion.readiness import resolve_question
+    for q in list(open_qs):
+        saved = resolved_by_cluster.get(_question_cluster(q.question_type, q.source_flag))
+        if not saved:
+            continue
+        resolve_question(
+            ev, q.question_id, saved.get("resolution") or "resolved",
+            actor=saved.get("resolved_by") or "reviewer",
+            resolution_type=saved.get("resolution_type") or "answer",
+            comment=saved.get("comments") or saved.get("resolution") or "resolved",
+        )
+    return ev
+
+
+def _hydrate_ui_evidence(ev):
+    from audit_ingestion.models import AuditOverview, AuditPeriod, DocumentFamily, Question
+    from audit_ingestion.readiness import apply_readiness
+    import uuid as _uuid
+
+    if _is_rent_receipt_name(ev.source_file):
+        try:
+            ev.family = DocumentFamily.PAYMENT
+        except Exception:
+            pass
+        ev.subtype = "rent_receipt"
+        if ev.audit_overview is None:
+            ev.audit_overview = AuditOverview(summary=ev.title or ev.source_file, period=AuditPeriod())
+        # Keep rent receipts classified consistently for user review
+        ev.audit_overview.audit_areas = ["expenses", "cash", "leases"]
+
+    if ev.readiness is None:
+        apply_readiness(ev)
+    ev = _inherit_shared_resolution(ev)
+
+    # For recurring lease/rent receipts, surface at least one actionable question
+    # when an agreement/attachment dependency is still open.
+    if _is_rent_receipt_name(ev.source_file) and ev.readiness:
+        open_qs = [q for q in (ev.readiness.questions or []) if not q.resolved]
+        has_agreement_q = any(_question_cluster(q.question_type, q.source_flag) == "agreement_dependency" for q in open_qs)
+        if not has_agreement_q:
+            for f in (ev.flags or []):
+                if f.type in {"reference_to_underlying_agreement", "reference_to_other_agreement", "attachment_reference"}:
+                    ev.readiness.questions.append(Question(
+                        question_id=f"q_{_uuid.uuid4().hex[:12]}",
+                        question_type="missing_agreement_request" if f.type != "attachment_reference" else "missing_attachment_request",
+                        question_text=(
+                            "This document references an underlying agreement. Please confirm the agreement has been provided separately."
+                            if f.type == "reference_to_underlying_agreement" else
+                            "This document references another agreement. Please confirm the referenced agreement is included in the upload."
+                            if f.type == "reference_to_other_agreement" else
+                            "This document references an attachment. Please confirm the attachment is included in the upload."
+                        ),
+                        audience="client",
+                        blocking=False,
+                        source_flag=f.type,
+                    ))
+                    if ev.readiness.readiness_status == "ready":
+                        ev.readiness.readiness_status = "exception_open"
+                    break
+    return ev
 
 
 def conf_badge(c: float) -> str:
@@ -368,7 +521,7 @@ with st.sidebar:
         ),
     )
     st.caption(f"Model: `gpt-5.4` | Mode: `{mode}`")
-    st.caption(f"Build: `{BUILD_VERSION}`")
+    st.caption(f"Build: `{DISPLAY_BUILD_VERSION}`")
 
     st.markdown("---")
     st.markdown("### 📋 v05 Architecture")
@@ -433,6 +586,7 @@ if run_btn and uploaded_files and api_key:
                 _bytes = st.session_state.get(f"_upload_bytes_{_fname}", b"")
                 _sig = compute_bytes_signature(_bytes) if _bytes else _fname
                 merge_state_into_evidence(_ev, file_signature=_sig)
+                _ev = _hydrate_ui_evidence(_ev)
                 _prior_payload = _prior_results.get(_fname)
                 _prior_ev = AuditEvidence(**((_prior_payload or {}).get("evidence") or {})) if _prior_payload else None
                 if _prior_ev:
@@ -463,6 +617,7 @@ for _idx, _result in enumerate(raw_results):
         _bytes = st.session_state.get(f"_upload_bytes_{_fname}", b"")
         _sig = compute_bytes_signature(_bytes) if _bytes else _fname
         merge_state_into_evidence(_ev, file_signature=_sig)
+        _ev = _hydrate_ui_evidence(_ev)
         raw_results[_idx]["evidence"] = _ev.model_dump()
     except Exception:
         pass
@@ -475,7 +630,9 @@ def _update_evidence_in_session(source_file: str, updater):
         if ev_data.get("source_file") != source_file:
             continue
         ev = AuditEvidence(**ev_data)
+        ev = _hydrate_ui_evidence(ev)
         updater(ev)
+        ev = _hydrate_ui_evidence(ev)
         persist_evidence_state(ev)
         st.session_state["v05_results"][idx]["evidence"] = ev.model_dump()
 
@@ -488,13 +645,15 @@ def _question_detail(ev, q):
 def _matching_bulk_targets(source_file: str, question_type: str, source_flag: str | None):
     from audit_ingestion.models import AuditEvidence
     targets = []
+    cluster = _question_cluster(question_type, source_flag)
+    source_is_rent = _is_rent_receipt_name(source_file)
     for result in st.session_state.get("v05_results", []):
         ev_data = result.get("evidence") or {}
         fname = ev_data.get("source_file")
         if not fname or fname == source_file:
             continue
         try:
-            ev = AuditEvidence(**ev_data)
+            ev = _hydrate_ui_evidence(AuditEvidence(**ev_data))
         except Exception:
             continue
         rd = ev.readiness
@@ -503,7 +662,9 @@ def _matching_bulk_targets(source_file: str, question_type: str, source_flag: st
         for q in rd.questions or []:
             if q.resolved:
                 continue
-            if q.question_type == question_type and q.source_flag == source_flag:
+            if _question_cluster(q.question_type, q.source_flag) == cluster:
+                if cluster == "agreement_dependency" and source_is_rent and not _is_rent_receipt_name(fname):
+                    continue
                 targets.append(fname)
                 break
     return sorted(set(targets))
@@ -577,7 +738,13 @@ for _r in raw_results:
     except Exception:
         pass
 _next_best = next_best_question(_evidence_items_for_queue)
-if _next_best:
+_action_queue = build_prioritized_action_queue(_evidence_items_for_queue)
+_agreement_items = [q for q in _action_queue if _question_cluster(q.get("question_type"), q.get("source_flag")) == "agreement_dependency" and _is_rent_receipt_name(q.get("source_file",""))]
+if _agreement_items and len({q.get("source_file") for q in _agreement_items}) > 1:
+    _affected = len({q.get("source_file") for q in _agreement_items})
+    st.info(f"Next best item: Shared lease-support issue affecting {_affected} rent receipts — answer one yellow question badge, then apply that answer to the other matching receipts.")
+    st.caption("Use the yellow question badge in Document Summary to answer one receipt and bulk-apply the same lease/agreement answer to the others.")
+elif _next_best:
     _best_detail = _next_best.get("flag_description") or _next_best["question_text"]
     st.info(f"Next best item: {_next_best['source_file']} — {_best_detail}")
     st.caption("Click the yellow question badge in Document Summary to answer only the questions for that file.")
@@ -606,11 +773,18 @@ for r in raw_results:
             from audit_ingestion.readiness import apply_readiness
             apply_readiness(ev)
         row = canonical_summary_row(ev)
-        row["status"] = r["status"].upper()
         rd = ev.readiness
+        _status = r["status"].upper()
+        if _status == "PARTIAL" and rd and rd.readiness_status != "needs_reviewer_confirmation":
+            _status = "SUCCESS"
+        row["status"] = _status
         row["readiness"] = rd.readiness_status if rd else ""
         row["blocking"]  = (rd.blocking_state == "blocking") if rd else False
         row["q_count"]   = sum(1 for q in (rd.questions or []) if not q.resolved) if rd else 0
+        row["resolution_history"] = _resolution_badge(ev)
+        if _is_rent_receipt_name(ev.source_file):
+            row["family"] = "rent_receipt"
+            row["audit_areas"] = "expenses, cash, leases"
         summary_rows.append(row)
     except Exception:
         summary_rows.append({
@@ -632,8 +806,8 @@ _STATUS_ICON = {"SUCCESS": "✅", "PARTIAL": "⚠️", "FAILED": "❌"}
 _STATUS_BG   = {"SUCCESS": "#f0fdf4", "PARTIAL": "#fffbeb", "FAILED": "#fef2f2"}
 
 # Header row
-_hc = st.columns([0.3, 2.5, 0.8, 1.0, 1.0, 1.4, 1.2, 0.8, 0.4])
-for col, label in zip(_hc, ["", "File", "Status", "Family", "Readiness",
+_hc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 0.8, 0.4])
+for col, label in zip(_hc, ["", "File", "Status", "Family", "Readiness", "Resolution",
                               "Audit Areas", "Confidence", "Questions", ""]):
     col.markdown(f"**{label}**")
 
@@ -648,7 +822,7 @@ for row in summary_rows:
     bg     = _STATUS_BG.get(status, "#ffffff")
     icon   = _STATUS_ICON.get(status, "—")
 
-    _rc = st.columns([0.3, 2.5, 0.8, 1.0, 1.0, 1.4, 1.2, 0.8, 0.4])
+    _rc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 0.8, 0.4])
     with _rc[0]:
         checked = st.checkbox("", key=f"chk_{fname}",
                               value=(fname in st.session_state["retry_selected"]),
@@ -672,10 +846,11 @@ for row in summary_rows:
     }.get(_rd, "—")
     _rd_label = _rd.replace("_", " ").title() if _rd else "—"
     _rc[4].markdown(f"<small>{_rd_icon} {_rd_label}</small>", unsafe_allow_html=True)
-    _rc[5].markdown(f"<small>{row.get('audit_areas','—')}</small>", unsafe_allow_html=True)
-    _rc[6].markdown(f"<small>{row.get('confidence','—')}</small>", unsafe_allow_html=True)
+    _rc[5].markdown(f"<small>{row.get('resolution_history','—')}</small>", unsafe_allow_html=True)
+    _rc[6].markdown(f"<small>{row.get('audit_areas','—')}</small>", unsafe_allow_html=True)
+    _rc[7].markdown(f"<small>{row.get('confidence','—')}</small>", unsafe_allow_html=True)
     _qc = row.get("q_count", 0)
-    with _rc[7]:
+    with _rc[8]:
         if _qc:
             if st.button(f"⚠️ {_qc} Q", key=f"summary_q_{fname}", help=f"Show open questions for {fname}"):
                 st.session_state["_summary_question_file"] = fname
@@ -683,7 +858,7 @@ for row in summary_rows:
                 st.rerun()
         else:
             st.markdown("<small>—</small>", unsafe_allow_html=True)
-    with _rc[8]:
+    with _rc[9]:
         if st.button("🗑", key=f"del_{fname}", help=f"Remove {fname} from results"):
             _new_results = [
                 r for r in st.session_state.get("v05_results", [])
@@ -736,12 +911,7 @@ if _summary_question_file:
                             _apply_files = []
                         _sq = st.columns([3.0, 1.2, 0.9, 1])
                         with _sq[0]:
-                            _ans = st.text_input(
-                                "Answer",
-                                key=f"summary_answer_{_summary_question_file}_{_qid}",
-                                placeholder="Type your answer or note here...",
-                                label_visibility="collapsed",
-                            )
+                            _ans = _render_question_answer_controls(f"summary_{_summary_question_file}_{_qid}", _q, _detail)
                         with _sq[1]:
                             _rtype = st.selectbox(
                                 "Resolution type",
@@ -802,194 +972,112 @@ _partial_files = [r for r in summary_rows if r.get("status") == "PARTIAL"]
 _needs_retry   = _failed_files + _partial_files
 _any_selected  = bool(st.session_state.get("retry_selected"))
 
-# Rerun controls — always shown when there are results
-st.markdown("#### 🔄 Rerun Controls")
-_r1, _r2, _r3, _r4, _r5 = st.columns([1.4, 1.2, 1.2, 1.2, 2])
+st.markdown("**Rerun / Cache**")
+_r1, _r2, _r3, _r4, _r5, _r6 = st.columns([1.15, 1.0, 1.0, 1.0, 1.5, 1.0])
 
 with _r1:
-    if st.button("▶ Rerun Selected", key="retry_selected_btn",
-                 type="primary" if _any_selected else "secondary"):
+    if st.button("Rerun Selected", key="retry_selected_btn", type="primary" if _any_selected else "secondary"):
         if not _any_selected:
-            st.warning("Check the boxes next to the files you want to rerun first.")
+            st.warning("Select at least one file first.")
         else:
             st.session_state["_retry_queue"] = list(st.session_state["retry_selected"])
             st.session_state["_retry_trigger"] = True
-
 with _r2:
     if st.button("Rerun All", key="retry_all_btn"):
         st.session_state["_retry_queue"] = [r["file"] for r in summary_rows]
         st.session_state["_retry_trigger"] = True
-
 with _r3:
-    if st.button("Retry All Failed", key="retry_all_failed_btn",
-                 disabled=not _failed_files):
+    if st.button("Retry Failed", key="retry_all_failed_btn", disabled=not _failed_files):
         st.session_state["_retry_queue"] = [r["file"] for r in _failed_files]
         st.session_state["_retry_trigger"] = True
-
 with _r4:
-    if st.button("Retry All Partial", key="retry_all_partial_btn",
-                 disabled=not _partial_files):
+    if st.button("Retry Partial", key="retry_all_partial_btn", disabled=not _partial_files):
         st.session_state["_retry_queue"] = [r["file"] for r in _partial_files]
         st.session_state["_retry_trigger"] = True
-
 with _r5:
-    _retry_mode_choice = st.radio(
-        "Mode",
-        ["Fast Review", "Deep Extraction"],
-        index=1,
-        horizontal=True,
-        key="retry_mode_radio",
-    )
-
-# Failed files quick view — only when there are failures
-if _needs_retry:
-    with st.expander(f"📋 Files needing attention ({len(_needs_retry)})", expanded=False):
-        for _nr in _needs_retry:
-            _icon = "❌" if _nr.get("status") == "FAILED" else "⚠️"
-            st.markdown(f"{_icon} **{_nr['file']}** — {_nr.get('family','?')} | "
-                        f"conf: {_nr.get('confidence','?')} | {_nr.get('time_s','')}")
-
-    # ── Execute retry when triggered ─────────────────────────────────────────
-    if st.session_state.get("_retry_trigger"):
-        st.session_state["_retry_trigger"] = False
-        _queue     = st.session_state.pop("_retry_queue", [])
-        _mode_key  = "deep" if st.session_state.get("retry_mode_radio") == "Deep Extraction" else "fast"
-        _api_key_r = st.session_state.get("api_key_input", "")
-        _uf_map    = {uf.name: uf for uf in st.session_state.get("uploaded_files_ref", [])}
-
-        _r_bar = st.progress(0)
-        _r_status = st.empty()
-        _retry_out = []
-        _retry_tim = {}
-
-        for _qi, _qf in enumerate(_queue):
-            _r_status.text(f"Retrying {_qf} ({_qi+1}/{len(_queue)})...")
-            _r_bar.progress((_qi + 1) / max(len(_queue), 1))
-            _uf = _uf_map.get(_qf)
-            import tempfile as _tf, time as _ti, os as _tos
-            # Fall back to stored bytes if the live uploader reference is gone
-            if _uf:
-                _fbytes = _uf.getvalue()
-            else:
-                _fbytes = st.session_state.get(f"_upload_bytes_{_qf}")
-            if not _fbytes:
-                st.warning(f"⚠️ {_qf} — file bytes not found. Upload the file again then retry.")
-                continue
-            with _tf.NamedTemporaryFile(
-                suffix=_tos.path.splitext(_qf)[1] or ".pdf",
-                delete=False, prefix="retry_"
-            ) as _tmp:
-                _tmp.write(_fbytes)
-                _tp = _tmp.name
-            _t0 = _ti.perf_counter()
-            try:
-                from audit_ingestion.router import ingest_one
-                _locked       = st.session_state.get("_retry_locked_type", {})
-                _override_type = _locked.get(_qf)
-                _sheet_lock   = st.session_state.get("_retry_excel_sheet", {})
-                _override_sheet = _sheet_lock.get(_qf)
-
-                # Clear the disk cache entry for this file so the retry
-                # forces a fresh AI call instead of returning the cached result
-                try:
-                    import hashlib, os as _cache_os
-                    _cache_dir_r = _cache_os.path.join(
-                        _cache_os.path.dirname(__file__), ".canonical_cache"
-                    )
-                    if _cache_os.path.isdir(_cache_dir_r):
-                        for _cf in _cache_os.listdir(_cache_dir_r):
-                            if _cf.endswith(".json"):
-                                _cache_os.unlink(_cache_os.path.join(_cache_dir_r, _cf))
-                                # Only need to clear — ingest_one will repopulate
-                                break  # Clear all entries to be safe on retry
-                        # Actually clear ALL entries since we want fresh results
-                        import shutil as _retry_shutil
-                        _retry_shutil.rmtree(_cache_dir_r, ignore_errors=True)
-                except Exception:
-                    pass
-
-                _res = ingest_one(
-                    _tp, api_key=_api_key_r, mode=_mode_key,
-                    allow_rescue=st.session_state.get("allow_rescue", False),
-                    financial_type_override=_override_type,
-                    financial_sheet_override=_override_sheet,
-                    bypass_cache=True,
-                )
-                _ev_dump = _res.evidence.model_dump() if _res.evidence else {}
-                # Force source_file back to the original filename — the temp path must not leak
-                if _ev_dump:
-                    _ev_dump["source_file"] = _qf
-                _retry_out.append({
-                    "status": _res.status,
-                    "evidence": _ev_dump,
-                    "errors": _res.errors, "engine_chain": _res.engine_chain,
-                })
-            except Exception as _ex:
-                _retry_out.append({
-                    "status": "failed",
-                    "evidence": {"source_file": _qf},
-                    "errors": [str(_ex)], "engine_chain": [],
-                })
-            finally:
-                try: _tos.unlink(_tp)
-                except: pass
-            _retry_tim[_qf] = round(_ti.perf_counter() - _t0, 1)
-
-        _r_bar.empty()
-        _r_status.empty()
-
-        if _retry_out:
-            def _get_fname(r):
-                # Results from original pipeline: file is in r["evidence"]["source_file"]
-                # Results from retry: file is also in r["evidence"]["source_file"]
-                return (r.get("evidence") or {}).get("source_file", r.get("file", "?"))
-            _existing = {_get_fname(r): r for r in st.session_state.get("v05_results", [])}
-            for _r in _retry_out:
-                _existing[_get_fname(_r)] = _r
-            st.session_state["v05_results"] = list(_existing.values())
-            _mt = dict(st.session_state.get("v05_timings", {}))
-            _mt.update(_retry_tim)
-            st.session_state["v05_timings"] = _mt
-            st.session_state["retry_selected"] = set()
-            st.success(f"✅ Retry complete — {len(_retry_out)} file(s) reprocessed.")
-            st.rerun()
-
-st.markdown("---")
-
-# Cache stats + clear button
-_cache_files = []
-if _os.path.isdir(_cache_dir):
-    _cache_files = [f for f in _os.listdir(_cache_dir) if f.endswith(".json")]
-
-# Warn if any files are Unusable — most common cause is a stale cache entry
-_unusable_files = [r for r in summary_rows if r.get("readiness") == "unusable"]
-if _unusable_files:
-    _u_names = ", ".join(r["file"] for r in _unusable_files[:3])
-    st.warning(
-        f"⚠️ **{len(_unusable_files)} file(s) showing Unusable** ({_u_names}). "
-        f"This is usually caused by a stale cache entry from a previous version. "
-        f"Click **Clear Cache** below and re-run those files."
-    )
-
-_cc1, _cc2, _cc3 = st.columns([2, 2, 1])
-_cc1.caption(f"💾 Disk cache: **{len(_cache_files)}** result(s) stored")
-_cc2.caption("Re-uploading the same files will skip OpenAI and use cache.")
-with _cc3:
-    if st.button("🗑 Clear Cache", help="Delete all cached canonical results"):
-        import shutil as _shutil
-        if _os.path.isdir(_cache_dir):
-            _shutil.rmtree(_cache_dir)
+    st.radio("Mode", ["Fast Review", "Deep Extraction"], index=1, horizontal=True, key="retry_mode_radio")
+with _r6:
+    if st.button("Clear Cache", key="clear_cache_compact"):
+        import shutil as _ccs
+        _ccs.rmtree(_cache_dir, ignore_errors=True)
         st.success("Cache cleared.")
         st.rerun()
 
-st.markdown("---")
+if _needs_retry:
+    st.caption(f"Files needing attention: {len(_needs_retry)}")
 
-# File detail selector
-st.markdown('<div class="section-title">Document Detail</div>', unsafe_allow_html=True)
-file_names = [r.get("evidence", {}).get("source_file", f"File {i}")
-              for i, r in enumerate(raw_results)]
-if "detail_selected" not in st.session_state or st.session_state["detail_selected"] not in file_names:
-    st.session_state["detail_selected"] = file_names[0] if file_names else None
+# ── Execute retry when triggered ─────────────────────────────────────────
+if st.session_state.get("_retry_trigger"):
+    st.session_state["_retry_trigger"] = False
+    _queue     = st.session_state.pop("_retry_queue", [])
+    _mode_key  = "deep" if st.session_state.get("retry_mode_radio") == "Deep Extraction" else "fast"
+    _api_key_r = st.session_state.get("api_key_input", "")
+    _uf_map    = {uf.name: uf for uf in st.session_state.get("uploaded_files_ref", [])}
+
+    _r_bar = st.progress(0)
+    _r_status = st.empty()
+    _retry_out = []
+    _retry_tim = {}
+
+    for _qi, _qf in enumerate(_queue):
+        _r_status.text(f"Retrying {_qf} ({_qi+1}/{len(_queue)})...")
+        _r_bar.progress((_qi + 1) / max(len(_queue), 1))
+        _uf = _uf_map.get(_qf)
+        import tempfile as _tf, time as _ti, os as _tos
+        _fbytes = _uf.getvalue() if _uf else st.session_state.get(f"_upload_bytes_{_qf}")
+        if not _fbytes:
+            st.warning(f"⚠️ {_qf} — file bytes not found. Upload the file again then retry.")
+            continue
+        with _tf.NamedTemporaryFile(suffix=_tos.path.splitext(_qf)[1] or ".pdf", delete=False, prefix="retry_") as _tmp:
+            _tmp.write(_fbytes)
+            _tp = _tmp.name
+        _t0 = _ti.perf_counter()
+        try:
+            from audit_ingestion.router import ingest_one
+            _locked       = st.session_state.get("_retry_locked_type", {})
+            _override_type = _locked.get(_qf)
+            _sheet_lock   = st.session_state.get("_retry_excel_sheet", {})
+            _override_sheet = _sheet_lock.get(_qf)
+            try:
+                import shutil as _retry_shutil
+                _retry_shutil.rmtree(_cache_dir, ignore_errors=True)
+            except Exception:
+                pass
+            _res = ingest_one(_tp, api_key=_api_key_r, mode=_mode_key, allow_rescue=st.session_state.get("allow_rescue", False), financial_type_override=_override_type, financial_sheet_override=_override_sheet, bypass_cache=True)
+            _ev_dump = _res.evidence.model_dump() if _res.evidence else {}
+            if _ev_dump:
+                _ev_dump["source_file"] = _qf
+            _retry_out.append({"status": _res.status, "evidence": _ev_dump, "errors": _res.errors, "engine_chain": _res.engine_chain})
+        except Exception as _ex:
+            _retry_out.append({"status": "failed", "evidence": {"source_file": _qf}, "errors": [str(_ex)], "engine_chain": []})
+        finally:
+            try: _tos.unlink(_tp)
+            except: pass
+        _retry_tim[_qf] = round(_ti.perf_counter() - _t0, 1)
+
+    _r_bar.empty()
+    _r_status.empty()
+
+    if _retry_out:
+        def _get_fname(r):
+            return (r.get("evidence") or {}).get("source_file", r.get("file", "?"))
+        _existing = {_get_fname(r): r for r in st.session_state.get("v05_results", [])}
+        for _r in _retry_out:
+            _existing[_get_fname(_r)] = _r
+        st.session_state["v05_results"] = list(_existing.values())
+        _mt = dict(st.session_state.get("v05_timings", {}))
+        _mt.update(_retry_tim)
+        st.session_state["v05_timings"] = _mt
+        st.session_state["retry_selected"] = set()
+        st.success(f"✅ Retry complete — {len(_retry_out)} file(s) reprocessed.")
+        st.rerun()
+
+# Cache stats (compact)
+_cache_files = []
+if _os.path.isdir(_cache_dir):
+    _cache_files = [f for f in _os.listdir(_cache_dir) if f.endswith(".json")]
+st.caption(f"Disk cache: {len(_cache_files)} result(s) stored")
+
 selected = st.selectbox("Select document to inspect", file_names, key="detail_selected")
 if st.session_state.get("_focus_question_id"):
     st.caption("Focused from Questions to Resolve")
@@ -1217,7 +1305,7 @@ if overview:
         _top_rows = _fin.get("top_flagged_rows_preview") or _row_diag.get("top_flagged_rows_preview") or []
 
         if _column_mapping:
-            st.markdown("**Step 5 — Column Mapping**")
+            st.markdown("**Column Mapping**")
             _map_rows = []
             for _canon, _meta in _column_mapping.items():
                 _map_rows.append({
@@ -1228,7 +1316,7 @@ if overview:
             st.dataframe(pd.DataFrame(_map_rows), use_container_width=True, hide_index=True)
 
         if _row_diag:
-            st.markdown("**Step 6 — Population Diagnostics**")
+            st.markdown("**Population Diagnostics**")
             _diag_cols = st.columns(5)
             _diag_cols[0].metric("Rows Retained", int(_row_diag.get("row_count", 0)))
             _diag_cols[1].metric("Flagged Rows", int(_row_diag.get("flagged_row_count", 0)))
@@ -1251,24 +1339,20 @@ if overview:
         # TB year fast-path
         if _ftype == "trial_balance_unknown_year":
             st.caption("This trial balance needs one more piece of information:")
-            _tb1, _tb2, _tb3 = st.columns([1.4, 1.4, 3])
-            if _tb1.button("✅ Current Year TB", key=f"tb_current_{selected}", type="primary"):
-                doc_specific["_financial"]["doc_type"] = "trial_balance_current"
+            _tb_choice = st.selectbox(
+                "Trial balance year",
+                ["", "Current-year trial balance", "Prior-year trial balance"],
+                key=f"tb_year_choice_{selected}",
+            )
+            if st.button("Apply trial balance year", key=f"tb_apply_{selected}", type="primary", disabled=not _tb_choice):
+                _target = "trial_balance_current" if "Current" in _tb_choice else "trial_balance_prior_year"
+                doc_specific.setdefault("_financial", {})["doc_type"] = _target
                 doc_specific["_financial"]["finality_state"] = "user_confirmed"
                 doc_specific["_financial"]["user_confirmed_type"] = True
+                _save_financial_override(selected, doc_specific["_financial"])
                 st.session_state["_retry_queue"] = [selected]
                 st.session_state["_retry_trigger"] = True
-                st.session_state["_retry_locked_type"] = {selected: "trial_balance_current"}
-                _save_financial_override(selected, doc_specific["_financial"])
-                st.rerun()
-            if _tb2.button("📁 Prior Year TB", key=f"tb_prior_{selected}"):
-                doc_specific["_financial"]["doc_type"] = "trial_balance_prior_year"
-                doc_specific["_financial"]["finality_state"] = "user_confirmed"
-                doc_specific["_financial"]["user_confirmed_type"] = True
-                st.session_state["_retry_queue"] = [selected]
-                st.session_state["_retry_trigger"] = True
-                st.session_state["_retry_locked_type"] = {selected: "trial_balance_prior_year"}
-                _save_financial_override(selected, doc_specific["_financial"])
+                st.session_state["_retry_locked_type"] = {selected: _target}
                 st.rerun()
 
         # Confirm detected type (for non-TB or any trusted file)
@@ -1412,11 +1496,7 @@ if _rd:
                         )
                     else:
                         _apply_files = []
-                    _resolution = st.text_input(
-                        "Your answer",
-                        key=f"resolution_{selected}_{_q.question_id}",
-                        placeholder="Type your response here...",
-                    )
+                    _resolution = _render_question_answer_controls(f"detail_{selected}_{_q.question_id}", _q, _flag_context)
                     _rcols = st.columns([2, 1])
                     with _rcols[0]:
                         _resolution_type = st.selectbox(

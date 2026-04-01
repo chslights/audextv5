@@ -394,13 +394,34 @@ def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, 
             evidence.audit_overview = AuditOverview(summary=evidence.title or evidence.source_file, period=AuditPeriod())
         elif not evidence.audit_overview.period:
             evidence.audit_overview.period = AuditPeriod()
-        evidence.audit_overview.period.effective_date = answer
-        overrides["period_effective_date"] = answer
         fin = (evidence.document_specific or {}).setdefault("_financial", {})
-        fin["period_start"] = answer
-        fin["period_end"] = answer
-        overrides["financial_period_start"] = answer
-        overrides["financial_period_end"] = answer
+        if len(answer) == 4 and answer.isdigit():
+            evidence.audit_overview.period.effective_date = answer
+            evidence.audit_overview.period.start = f"{answer}-01-01"
+            evidence.audit_overview.period.end = f"{answer}-12-31"
+            fin["period_start"] = evidence.audit_overview.period.start
+            fin["period_end"] = evidence.audit_overview.period.end
+            fin["fiscal_year"] = answer
+            overrides["period_effective_date"] = answer
+            overrides["financial_period_start"] = fin["period_start"]
+            overrides["financial_period_end"] = fin["period_end"]
+        elif " to " in answer:
+            _start, _end = [x.strip() for x in answer.split(" to ", 1)]
+            evidence.audit_overview.period.start = _start
+            evidence.audit_overview.period.end = _end
+            evidence.audit_overview.period.effective_date = f"{_start} to {_end}"
+            fin["period_start"] = _start
+            fin["period_end"] = _end
+            overrides["period_effective_date"] = evidence.audit_overview.period.effective_date
+            overrides["financial_period_start"] = _start
+            overrides["financial_period_end"] = _end
+        else:
+            evidence.audit_overview.period.effective_date = answer
+            fin["period_start"] = answer
+            fin["period_end"] = answer
+            overrides["period_effective_date"] = answer
+            overrides["financial_period_start"] = answer
+            overrides["financial_period_end"] = answer
         remove_flag = True
     elif question.question_type == "current_vs_prior_year_confirmation" and answer:
         normalized = answer.lower()
