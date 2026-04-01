@@ -352,6 +352,32 @@ def build_action_queue(evidence_items: list[AuditEvidence]) -> list[dict]:
 
 
 
+
+def _record_resolved_exception(evidence: AuditEvidence, question: Question, resolution: str) -> None:
+    if not question.source_flag:
+        return
+    ds = evidence.document_specific or {}
+    wf = dict(ds.get("_workflow") or {})
+    resolved = list(wf.get("resolved_exceptions") or [])
+    flag = next((f for f in (evidence.flags or []) if f.type == question.source_flag), None)
+    entry = {
+        "source_flag": question.source_flag,
+        "question_type": question.question_type,
+        "question_text": question.question_text,
+        "flag_description": flag.description if flag else "",
+        "severity": flag.severity if flag else "warning",
+        "resolution": (resolution or "resolved").strip(),
+        "resolution_type": question.resolution_type or "answer",
+        "resolved_at": question.resolved_at or utc_now_iso(),
+        "resolved_by": question.resolved_by or "reviewer",
+    }
+    resolved = [r for r in resolved if not (r.get("source_flag") == entry["source_flag"] and r.get("question_type") == entry["question_type"])]
+    resolved.append(entry)
+    wf["resolved_exceptions"] = resolved
+    ds["_workflow"] = wf
+    evidence.document_specific = ds
+
+
 def _remove_flag(evidence: AuditEvidence, flag_type: str | None) -> None:
     if not flag_type:
         return
@@ -362,6 +388,7 @@ def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, 
     ensure = (evidence.document_specific or {}).setdefault("_workflow", {})
     overrides = ensure.setdefault("field_overrides", {})
     answer = (resolution or "").strip()
+    remove_flag = False
     if question.question_type == "period_confirmation" and answer:
         if not evidence.audit_overview:
             evidence.audit_overview = AuditOverview(summary=evidence.title or evidence.source_file, period=AuditPeriod())
@@ -371,8 +398,10 @@ def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, 
         overrides["period_effective_date"] = answer
         fin = (evidence.document_specific or {}).setdefault("_financial", {})
         fin["period_start"] = answer
+        fin["period_end"] = answer
         overrides["financial_period_start"] = answer
-        _remove_flag(evidence, question.source_flag)
+        overrides["financial_period_end"] = answer
+        remove_flag = True
     elif question.question_type == "current_vs_prior_year_confirmation" and answer:
         normalized = answer.lower()
         finality = "prior_year" if "prior" in normalized else "current_year" if "current" in normalized else ""
@@ -383,11 +412,18 @@ def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, 
             if (evidence.subtype or "").startswith("trial_balance"):
                 evidence.subtype = f"trial_balance_{finality}"
                 overrides["subtype"] = evidence.subtype
-        _remove_flag(evidence, question.source_flag)
+        remove_flag = True
     elif question.resolution_type in ("override", "dismissed", "reviewer_confirmed") or question.audience == "reviewer":
-        _remove_flag(evidence, question.source_flag)
+        remove_flag = True
     elif question.source_flag == "duplicate_entry" and answer:
-        # keep exact answer in workflow, but remove active blocker so summary updates after explanation/correction
+        remove_flag = True
+    elif answer:
+        # For non-blocking client confirmations like attachment/agreement references,
+        # a direct answer should close the exception instead of leaving it active.
+        remove_flag = True
+
+    if remove_flag and question.source_flag:
+        _record_resolved_exception(evidence, question, answer or "resolved")
         _remove_flag(evidence, question.source_flag)
 
 

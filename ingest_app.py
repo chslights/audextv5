@@ -1328,18 +1328,20 @@ if _rd:
         f"padding:10px 16px;border-radius:0 6px 6px 0;margin-bottom:8px'>"
         f"<span style='font-weight:700;color:{_color}'>{_label}</span>"
         + (f" &nbsp;|&nbsp; <span style='color:#6b7280;font-size:0.85rem'>"
-           f"{len(_rd.questions)} question(s)</span>"
-           if _rd.questions else "")
+           f"{sum(1 for _q in (_rd.questions or []) if not _q.resolved)} question(s)</span>"
+           if any(not _q.resolved for _q in (_rd.questions or [])) else "")
         + "</div>",
         unsafe_allow_html=True
     )
 
     _wf = (ev.document_specific or {}).get("_workflow") or {}
     _lineage = _wf.get("lineage") or {}
+    _resolved_exceptions_meta = list(_wf.get("resolved_exceptions") or [])
+    _open_questions = [q for q in (_rd.questions or []) if not q.resolved]
+    if _rd_status == "exception_open" and not _open_questions and _resolved_exceptions_meta:
+        _bg, _color, _label = ("#f0fdf4", "#15803d", "✅ Exception Closed")
     if _lineage.get("replaces"):
         st.caption(f"Supersedes prior version: {_lineage['replaces']}")
-    if _wf.get("question_history"):
-        st.caption(f"Workflow history entries: {len(_wf['question_history'])}")
 
     # Population readiness for financial files
     if _rd.population_ready is not None:
@@ -1363,8 +1365,8 @@ if _rd:
     # Questions panel
     if _rd.questions:
         _focused_qid = st.session_state.get("_focus_question_id")
-        _reviewer_qs = [q for q in _rd.questions if q.audience == "reviewer"]
-        _client_qs   = [q for q in _rd.questions if q.audience == "client"]
+        _reviewer_qs = [q for q in _rd.questions if q.audience == "reviewer" and not q.resolved]
+        _client_qs   = [q for q in _rd.questions if q.audience == "client" and not q.resolved]
 
         for _qlabel, _qlist, _qcolor in [
             ("🔵 Reviewer Questions", _reviewer_qs, "#1d4ed8"),
@@ -1552,33 +1554,37 @@ if ev.claims:
         )
 
 # ── Section 4: Flags ──────────────────────────────────────────────────────────
-if ev.flags:
-    _resolved_flag_types = {q.source_flag for q in (_rd.questions or []) if q.resolved and q.source_flag} if _rd else set()
-    _active_flags = [flag for flag in ev.flags if flag.type not in _resolved_flag_types]
-    _resolved_flags = [flag for flag in ev.flags if flag.type in _resolved_flag_types]
-    if _active_flags or _resolved_flags:
-        st.markdown('<div class="section-title">🚩 Flags & Exceptions</div>', unsafe_allow_html=True)
-    if _active_flags:
-        for flag in _active_flags:
-            severity = flag.severity
+_wf_for_flags = (ev.document_specific or {}).get("_workflow") or {}
+_resolved_exception_rows = list(_wf_for_flags.get("resolved_exceptions") or [])
+_active_flags = list(ev.flags or [])
+if _active_flags or _resolved_exception_rows:
+    st.markdown('<div class="section-title">🚩 Flags & Exceptions</div>', unsafe_allow_html=True)
+if _active_flags:
+    for flag in _active_flags:
+        severity = flag.severity
+        st.markdown(
+            f'<div class="flag-{severity}">'
+            f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
+            f'{flag.description}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+if _resolved_exception_rows:
+    with st.expander(f"Resolved exceptions ({len(_resolved_exception_rows)})", expanded=False):
+        for item in _resolved_exception_rows:
+            severity = item.get("severity", "warning")
+            flag_type = item.get("source_flag", "resolved_exception")
+            desc = item.get("flag_description", "")
+            resolution = item.get("resolution", "resolved")
+            resolution_type = item.get("resolution_type", "answer")
             st.markdown(
                 f'<div class="flag-{severity}">'
-                f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
-                f'{flag.description}'
+                f'<strong>[{severity.upper()}] {flag_type}</strong><br>'
+                f'{desc}'
+                f'<div style="margin-top:6px;padding:6px 8px;background:#ecfdf5;border-radius:4px;color:#166534">✅ Resolved: {resolution} <span style="color:#6b7280">({resolution_type})</span></div>'
                 f'</div>',
                 unsafe_allow_html=True
             )
-    if _resolved_flags:
-        with st.expander(f"Resolved exceptions ({len(_resolved_flags)})", expanded=False):
-            for flag in _resolved_flags:
-                severity = flag.severity
-                st.markdown(
-                    f'<div class="flag-{severity}">'
-                    f'<strong>[{severity.upper()}] {flag.type}</strong><br>'
-                    f'{flag.description}'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
 
 # ── Section 5: Link Keys ──────────────────────────────────────────────────────
 lk = ev.link_keys

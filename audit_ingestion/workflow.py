@@ -71,6 +71,7 @@ def ensure_workflow_metadata(evidence: AuditEvidence, file_signature: str | None
     wf.setdefault("lineage", {})
     wf.setdefault("question_history", [])
     wf.setdefault("field_overrides", {})
+    wf.setdefault("resolved_exceptions", [])
     ds["_workflow"] = wf
     evidence.document_specific = ds
     return evidence
@@ -101,6 +102,7 @@ def merge_state_into_evidence(evidence: AuditEvidence, file_signature: str | Non
             q.comments = item.get("comments")
     wf.setdefault("question_history", saved.get("question_history", []))
     wf.setdefault("lineage", saved.get("lineage", {}))
+    wf.setdefault("resolved_exceptions", saved.get("resolved_exceptions", []))
     overrides = saved.get("field_overrides", {}) or wf.get("field_overrides", {})
     wf["field_overrides"] = overrides
     evidence.document_specific["_workflow"] = wf
@@ -162,6 +164,7 @@ def persist_evidence_state(evidence: AuditEvidence, state: dict[str, Any] | None
         "question_history": wf.get("question_history", []),
         "lineage": wf.get("lineage", {}),
         "field_overrides": wf.get("field_overrides", {}),
+        "resolved_exceptions": wf.get("resolved_exceptions", []),
     }
     save_state(state, path)
     return state
