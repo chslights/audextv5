@@ -147,6 +147,9 @@ def _apply_field_overrides(evidence: AuditEvidence, overrides: dict[str, Any]) -
     if overrides.get("financial_finality_state"):
         fin["finality_state"] = overrides.get("financial_finality_state")
         evidence.flags = [f for f in (evidence.flags or []) if f.type != "tb_year_unconfirmed"]
+    if overrides.get("financial_doc_type"):
+        fin["doc_type"] = overrides.get("financial_doc_type")
+        fin["doc_type_source"] = "user_override"
     if overrides.get("subtype"):
         evidence.subtype = overrides.get("subtype")
     return evidence

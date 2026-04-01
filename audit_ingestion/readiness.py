@@ -425,14 +425,30 @@ def _apply_resolution_side_effects(evidence: AuditEvidence, question: Question, 
         remove_flag = True
     elif question.question_type == "current_vs_prior_year_confirmation" and answer:
         normalized = answer.lower()
-        finality = "prior_year" if "prior" in normalized else "current_year" if "current" in normalized else ""
         fin = (evidence.document_specific or {}).setdefault("_financial", {})
-        if finality:
-            fin["finality_state"] = finality
-            overrides["financial_finality_state"] = finality
-            if (evidence.subtype or "").startswith("trial_balance"):
-                evidence.subtype = f"trial_balance_{finality}"
-                overrides["subtype"] = evidence.subtype
+        doc_type = ""
+        if "prior" in normalized:
+            doc_type = "trial_balance_prior_year"
+        elif "current" in normalized:
+            doc_type = "trial_balance_current"
+        if doc_type:
+            fin["doc_type"] = doc_type
+            fin["finality_state"] = "user_confirmed"
+            fin["doc_type_source"] = "user_override"
+            overrides["financial_doc_type"] = doc_type
+            overrides["financial_finality_state"] = "user_confirmed"
+            evidence.subtype = doc_type
+            overrides["subtype"] = evidence.subtype
+            # Keep family/audit metadata in sync for user-confirmed trial balances.
+            try:
+                from .models import DocumentFamily
+                evidence.family = DocumentFamily("accounting_report")
+            except Exception:
+                pass
+            if not evidence.audit_overview:
+                evidence.audit_overview = AuditOverview(summary=evidence.title or evidence.source_file, period=AuditPeriod())
+            evidence.audit_overview.audit_areas = ["cash", "receivables", "prepaid"]
+            evidence.audit_overview.assertions = ["accuracy", "existence", "rights_and_obligations", "classification"]
         remove_flag = True
     elif question.resolution_type in ("override", "dismissed", "reviewer_confirmed") or question.audience == "reviewer":
         remove_flag = True

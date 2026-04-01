@@ -27,7 +27,7 @@ from audit_ingestion.workflow import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 BUILD_VERSION = "v05.1"
-DISPLAY_BUILD_VERSION = "V.05.30"
+DISPLAY_BUILD_VERSION = "V.05.34"
 
 st.set_page_config(
     page_title="Audit Ingestion v05",
@@ -185,6 +185,31 @@ def _hydrate_ui_evidence(ev):
     from audit_ingestion.readiness import apply_readiness
     import uuid as _uuid
 
+    fin = (ev.document_specific or {}).get("_financial") or {}
+    # Normalize any older override state so current-year/prior-year TB confirmations
+    # rebuild the same way as directly-classified structured files.
+    if fin.get("finality_state") in {"current_year", "prior_year"}:
+        fin["doc_type"] = "trial_balance_current" if fin.get("finality_state") == "current_year" else "trial_balance_prior_year"
+        fin["finality_state"] = "user_confirmed"
+        fin["doc_type_source"] = "user_override"
+        ev.subtype = fin["doc_type"]
+    if fin.get("doc_type") in {"trial_balance_current", "trial_balance_prior_year", "trial_balance_unknown_year"}:
+        try:
+            ev.family = DocumentFamily("accounting_report")
+        except Exception:
+            pass
+        if ev.audit_overview is None:
+            ev.audit_overview = AuditOverview(summary=ev.title or ev.source_file, period=AuditPeriod())
+        areas, assertions = _financial_defaults(fin.get("doc_type"))
+        if not ev.audit_overview.audit_areas:
+            ev.audit_overview.audit_areas = areas
+        if not ev.audit_overview.assertions:
+            ev.audit_overview.assertions = assertions
+        if not getattr(ev, "audit_areas", None):
+            ev.audit_areas = list(ev.audit_overview.audit_areas or [])
+        if not getattr(ev, "assertions", None):
+            ev.assertions = list(ev.audit_overview.assertions or [])
+
     if _is_rent_receipt_name(ev.source_file):
         try:
             ev.family = DocumentFamily.PAYMENT
@@ -225,8 +250,34 @@ def _hydrate_ui_evidence(ev):
                     if ev.readiness.readiness_status == "ready":
                         ev.readiness.readiness_status = "exception_open"
                     break
+    # Hard consistency rule: a file cannot remain Exception Open with zero open questions.
+    if ev.readiness:
+        _open_qs = [q for q in (ev.readiness.questions or []) if not q.resolved]
+        _wf = (ev.document_specific or {}).get("_workflow", {}) or {}
+        if ev.readiness.readiness_status == "exception_open" and not _open_qs:
+            ev.readiness.readiness_status = "ready"
+            ev.readiness.blocking_state = "non_blocking"
+            ev.readiness.blocking_issues = []
+            # Remove any stale active flags already captured as resolved exceptions.
+            _resolved_keys = {item.get("source_flag") for item in (_wf.get("resolved_exceptions") or []) if item.get("source_flag")}
+            if _resolved_keys:
+                ev.flags = [f for f in (ev.flags or []) if getattr(f, "type", None) not in _resolved_keys]
     return ev
 
+
+
+
+def _financial_defaults(fin_doc_type: str | None):
+    mapping = {
+        "trial_balance_current": (["cash", "receivables", "prepaid"], ["accuracy", "existence", "rights_and_obligations", "classification"]),
+        "trial_balance_prior_year": (["cash", "receivables", "prepaid"], ["accuracy", "existence", "rights_and_obligations", "classification"]),
+        "trial_balance_unknown_year": (["cash", "receivables", "prepaid"], ["accuracy", "existence", "rights_and_obligations", "classification"]),
+        "general_ledger": (["revenue", "expenses", "payroll"], ["accuracy", "classification", "completeness"]),
+        "budget": (["revenue", "expenses", "grants"], ["classification", "completeness"]),
+        "bank_statement_csv": (["cash", "revenue", "expenses"], ["accuracy", "existence"]),
+        "chart_of_accounts": (["classification"], ["classification"]),
+    }
+    return mapping.get(fin_doc_type or "", ([], []))
 
 def conf_badge(c: float) -> str:
     if c >= 0.80: color = "#16a34a"
@@ -728,33 +779,16 @@ m4.metric("❌ Failed", failed)
 
 st.markdown("---")
 
-# Light question guidance — use the summary badge to open file-specific questions.
+# Light question guidance — kept next to Document Summary to avoid creating a separate hero area.
 from audit_ingestion.readiness import resolve_question
-_evidence_items_for_queue = []
-for _r in raw_results:
-    _ev_data = _r.get("evidence") or {}
-    try:
-        _evidence_items_for_queue.append(AuditEvidence(**_ev_data))
-    except Exception:
-        pass
-_next_best = next_best_question(_evidence_items_for_queue)
-_action_queue = build_prioritized_action_queue(_evidence_items_for_queue)
-_agreement_items = [q for q in _action_queue if _question_cluster(q.get("question_type"), q.get("source_flag")) == "agreement_dependency" and _is_rent_receipt_name(q.get("source_file",""))]
-if _agreement_items and len({q.get("source_file") for q in _agreement_items}) > 1:
-    _affected = len({q.get("source_file") for q in _agreement_items})
-    st.info(f"Next best item: Shared lease-support issue affecting {_affected} rent receipts — answer one yellow question badge, then apply that answer to the other matching receipts.")
-    st.caption("Use the yellow question badge in Document Summary to answer one receipt and bulk-apply the same lease/agreement answer to the others.")
-elif _next_best:
-    _best_detail = _next_best.get("flag_description") or _next_best["question_text"]
-    st.info(f"Next best item: {_next_best['source_file']} — {_best_detail}")
-    st.caption("Click the yellow question badge in Document Summary to answer only the questions for that file.")
 if st.session_state.get("_opened_from_queue"):
     st.success(f"Opened {st.session_state['_opened_from_queue']} below in Document Detail.")
     st.session_state.pop("_opened_from_queue")
-st.markdown("---")
 
 # Summary table
-st.markdown('<div class="section-title">Document Summary</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title" style="margin-top:8px">Document Summary</div>', unsafe_allow_html=True)
+st.caption("Click the yellow question badge in Document Summary to answer only the questions for that file.")
+st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
 from audit_ingestion.legacy import canonical_summary_row
 from audit_ingestion.models import AuditEvidence
@@ -772,6 +806,7 @@ for r in raw_results:
         if ev.readiness is None:
             from audit_ingestion.readiness import apply_readiness
             apply_readiness(ev)
+        ev = _hydrate_ui_evidence(ev)
         row = canonical_summary_row(ev)
         rd = ev.readiness
         _status = r["status"].upper()
@@ -1101,6 +1136,42 @@ except Exception as e:
 
 meta = ev.extraction_meta
 overview = ev.audit_overview
+
+# Fallback overview for structured financial files when summary content is sparse.
+if (not overview) or (overview and not getattr(overview, "audit_areas", None)):
+    _fallback_fin = (ev.document_specific or {}).get("_financial") or {}
+    if _fallback_fin and _fallback_fin.get("doc_type") and _fallback_fin.get("doc_type") != "not_financial_structured_data":
+        from types import SimpleNamespace
+        _doc_type = _fallback_fin.get("doc_type")
+        _period_start = _fallback_fin.get("period_start")
+        _period_end = _fallback_fin.get("period_end")
+        _summary_bits = []
+        if _doc_type:
+            _summary_bits.append(_doc_type.replace("_", " "))
+        _row_diag_fb = _fallback_fin.get("row_diagnostics") or {}
+        if _row_diag_fb.get("row_count"):
+            _summary_bits.append(f"{int(_row_diag_fb.get('row_count',0))} rows retained")
+        _bal = _fallback_fin.get("balance_check") or {}
+        if _doc_type.startswith("trial_balance"):
+            if _bal.get("difference", 0) == 0:
+                _summary_bits.append("balanced")
+            elif _bal.get("difference") is not None:
+                _summary_bits.append(f"difference ${float(_bal.get('difference',0)):,.2f}")
+        _period_obj = None
+        if _period_start or _period_end:
+            _period_obj = SimpleNamespace(effective_date=None, start=_period_start, end=_period_end, term_months=None)
+        _def_areas, _def_assertions = _financial_defaults(_doc_type)
+        overview = SimpleNamespace(
+            summary=("Structured financial file: " + ", ".join(_summary_bits)) if _summary_bits else "Structured financial file imported.",
+            audit_areas=list(ev.audit_areas or _def_areas),
+            assertions=list(ev.assertions or _def_assertions),
+            period=_period_obj,
+            match_targets=[],
+        )
+        if not getattr(ev, "audit_areas", None):
+            ev.audit_areas = list(overview.audit_areas or [])
+        if not getattr(ev, "assertions", None):
+            ev.assertions = list(overview.assertions or [])
 
 # ── Section 1: Auditor Snapshot ───────────────────────────────────────────────
 if overview:
@@ -1442,13 +1513,17 @@ if _rd:
                 unsafe_allow_html=True
             )
         else:
-            st.markdown(
-                "<div style='background:#fff7ed;border:1px solid #fdba74;"
-                "padding:6px 14px;border-radius:4px;display:inline-block;margin-bottom:8px'>"
-                "<span style='color:#c2410c;font-weight:600'>📊 Evidence Only</span> "
-                f"<span style='color:#4b5563;font-size:0.82rem'>— {_rd.population_status}</span></div>",
-                unsafe_allow_html=True
-            )
+            _pop_status = _rd.population_status or ""
+            _fin_local = (ev.document_specific or {}).get("_financial") or {}
+            _user_confirmed = _fin_local.get("finality_state") == "user_confirmed"
+            if not (_user_confirmed and "classification not confirmed" in _pop_status.lower()):
+                st.markdown(
+                    "<div style='background:#fff7ed;border:1px solid #fdba74;"
+                    "padding:6px 14px;border-radius:4px;display:inline-block;margin-bottom:8px'>"
+                    "<span style='color:#c2410c;font-weight:600'>📊 Evidence Only</span> "
+                    f"<span style='color:#4b5563;font-size:0.82rem'>— {_pop_status}</span></div>",
+                    unsafe_allow_html=True
+                )
 
     # Questions panel
     if _rd.questions:
