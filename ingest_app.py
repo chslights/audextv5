@@ -1321,25 +1321,25 @@ if _rd:
         "exception_open":               ("#fff7ed", "#c2410c", "🟠 Exception Open"),
         "unusable":                     ("#fef2f2", "#991b1b", "❌ Unusable"),
     }
+    _wf = (ev.document_specific or {}).get("_workflow") or {}
+    _lineage = _wf.get("lineage") or {}
+    _resolved_exceptions_meta = list(_wf.get("resolved_exceptions") or [])
+    _open_questions = [q for q in (_rd.questions or []) if not q.resolved]
     _bg, _color, _label = _rd_colors.get(_rd_status, ("#f9fafb", "#374151", _rd_status))
+    if _rd_status == "exception_open" and not _open_questions and _resolved_exceptions_meta:
+        _bg, _color, _label = ("#f0fdf4", "#15803d", "✅ Exception Closed")
 
     st.markdown(
         f"<div style='background:{_bg};border-left:4px solid {_color};"
         f"padding:10px 16px;border-radius:0 6px 6px 0;margin-bottom:8px'>"
         f"<span style='font-weight:700;color:{_color}'>{_label}</span>"
         + (f" &nbsp;|&nbsp; <span style='color:#6b7280;font-size:0.85rem'>"
-           f"{sum(1 for _q in (_rd.questions or []) if not _q.resolved)} question(s)</span>"
-           if any(not _q.resolved for _q in (_rd.questions or [])) else "")
+           f"{len(_open_questions)} question(s)</span>"
+           if _open_questions else "")
         + "</div>",
         unsafe_allow_html=True
     )
 
-    _wf = (ev.document_specific or {}).get("_workflow") or {}
-    _lineage = _wf.get("lineage") or {}
-    _resolved_exceptions_meta = list(_wf.get("resolved_exceptions") or [])
-    _open_questions = [q for q in (_rd.questions or []) if not q.resolved]
-    if _rd_status == "exception_open" and not _open_questions and _resolved_exceptions_meta:
-        _bg, _color, _label = ("#f0fdf4", "#15803d", "✅ Exception Closed")
     if _lineage.get("replaces"):
         st.caption(f"Supersedes prior version: {_lineage['replaces']}")
 
@@ -1556,7 +1556,8 @@ if ev.claims:
 # ── Section 4: Flags ──────────────────────────────────────────────────────────
 _wf_for_flags = (ev.document_specific or {}).get("_workflow") or {}
 _resolved_exception_rows = list(_wf_for_flags.get("resolved_exceptions") or [])
-_active_flags = list(ev.flags or [])
+_resolved_flag_keys = {item.get("source_flag") for item in _resolved_exception_rows if item.get("source_flag")}
+_active_flags = [flag for flag in (ev.flags or []) if getattr(flag, "type", None) not in _resolved_flag_keys]
 if _active_flags or _resolved_exception_rows:
     st.markdown('<div class="section-title">🚩 Flags & Exceptions</div>', unsafe_allow_html=True)
 if _active_flags:
