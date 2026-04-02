@@ -205,10 +205,13 @@ def _hydrate_ui_evidence(ev):
             ev.audit_overview.audit_areas = areas
         if not ev.audit_overview.assertions:
             ev.audit_overview.assertions = assertions
-        if not getattr(ev, "audit_areas", None):
-            ev.audit_areas = list(ev.audit_overview.audit_areas or [])
-        if not getattr(ev, "assertions", None):
-            ev.assertions = list(ev.audit_overview.assertions or [])
+        # Older builds sometimes expected top-level audit_areas/assertions fields,
+        # but the pydantic model stores these under audit_overview.
+        # Keep everything on audit_overview to avoid setattr/getattr crashes.
+        if not getattr(ev.audit_overview, "audit_areas", None):
+            ev.audit_overview.audit_areas = list(areas or [])
+        if not getattr(ev.audit_overview, "assertions", None):
+            ev.audit_overview.assertions = list(assertions or [])
 
     if _is_rent_receipt_name(ev.source_file):
         try:
@@ -1161,31 +1164,33 @@ if (not overview) or (overview and not getattr(overview, "audit_areas", None)):
         if _period_start or _period_end:
             _period_obj = SimpleNamespace(effective_date=None, start=_period_start, end=_period_end, term_months=None)
         _def_areas, _def_assertions = _financial_defaults(_doc_type)
-        _ev_audit_areas = getattr(ev, "audit_areas", None) or []
-        _ev_assertions = getattr(ev, "assertions", None) or []
+        _ev_overview = getattr(ev, "audit_overview", None)
+        _ov_areas = list(getattr(_ev_overview, "audit_areas", None) or _def_areas)
+        _ov_assertions = list(getattr(_ev_overview, "assertions", None) or _def_assertions)
         overview = SimpleNamespace(
             summary=("Structured financial file: " + ", ".join(_summary_bits)) if _summary_bits else "Structured financial file imported.",
-            audit_areas=list(_ev_audit_areas or _def_areas),
-            assertions=list(_ev_assertions or _def_assertions),
+            audit_areas=_ov_areas,
+            assertions=_ov_assertions,
             period=_period_obj,
             match_targets=[],
         )
-        if not _ev_audit_areas:
+        if _ev_overview is None:
             try:
-                ev.audit_areas = list(overview.audit_areas or [])
+                from audit_ingestion.models import AuditOverview as _AO
+                ev.audit_overview = _AO(summary=overview.summary, audit_areas=_ov_areas, assertions=_ov_assertions, period=None, match_targets=[])
             except Exception:
                 pass
-        if not _ev_assertions:
-            try:
-                ev.assertions = list(overview.assertions or [])
-            except Exception:
-                pass
+        else:
+            if not getattr(_ev_overview, "audit_areas", None):
+                _ev_overview.audit_areas = _ov_areas
+            if not getattr(_ev_overview, "assertions", None):
+                _ev_overview.assertions = _ov_assertions
 
 # ── Section 1: Auditor Snapshot ───────────────────────────────────────────────
 if overview:
     st.markdown('<div class="section-title">🔍 Auditor Snapshot</div>', unsafe_allow_html=True)
 
-    family = ev.family.value.replace("_", " ").title()
+    family = ((getattr(ev, "family", None).value if getattr(ev, "family", None) else "other").replace("_", " ").title())
     subtype = ev.subtype or "—"
     c1, c2, c3 = st.columns(3)
     c1.markdown(f"**Document Family:** `{family}`")
